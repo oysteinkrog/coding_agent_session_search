@@ -130,6 +130,14 @@ security-framework = "3.7.0"
 [target.'cfg(not(windows))'.dependencies]
 openssl = { version = "0.10.79", features = ["vendored"] }
 
+# DirectML GPU execution provider for semantic embedding (opt-in at runtime via
+# CASS_SEMANTIC_GPU=1; CPU remains the default). The pyke onnxruntime binaries
+# already ship with DirectML compiled in on Windows; these features only enable
+# the registration API. DirectML.dll ships with Windows 10 1903+.
+[target.'cfg(windows)'.dependencies]
+fastembed = { version = "5.13.4", default-features = false, features = ["ort-download-binaries-rustls-tls", "directml"] }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["directml"] }
+
 [features]
 default = ["qr", "encryption"]
 qr = ["dep:qrcode", "dep:image"]

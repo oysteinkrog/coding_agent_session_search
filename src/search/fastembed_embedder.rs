@@ -252,14 +252,7 @@ impl FastEmbedder {
         let mut model = UserDefinedEmbeddingModel::new(model_file, tokenizer_files);
         model.pooling = Some(config.pooling);
 
-        let init_options = InitOptionsUserDefined::new();
-
-        let model = TextEmbedding::try_new_from_user_defined(model, init_options).map_err(|e| {
-            EmbedderError::EmbeddingFailed {
-                model: config.embedder_id.clone(),
-                source: Box::new(std::io::Error::other(format!("fastembed init failed: {e}"))),
-            }
-        })?;
+        let model = Self::init_text_embedding(model, &config.embedder_id)?;
 
         Ok(Self {
             model: Mutex::new(model),
@@ -297,6 +290,65 @@ impl FastEmbedder {
         &self.model_id
     }
 
+    /// Build the fastembed session, honoring the CASS_SEMANTIC_GPU opt-in.
+    ///
+    /// GPU init failure falls back to CPU with a logged warning; it never
+    /// propagates as an error so indexing keeps working on machines where
+    /// DirectML is unavailable.
+    fn init_text_embedding(
+        model: UserDefinedEmbeddingModel,
+        embedder_id: &str,
+    ) -> EmbedderResult<TextEmbedding> {
+        #[cfg(windows)]
+        if semantic_gpu_requested() {
+            match Self::init_text_embedding_directml(model.clone()) {
+                Ok(session) => {
+                    tracing::info!(
+                        embedder = embedder_id,
+                        "semantic embedder running on DirectML GPU (CASS_SEMANTIC_GPU)"
+                    );
+                    return Ok(session);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        embedder = embedder_id,
+                        error = %e,
+                        "DirectML GPU init failed; falling back to CPU embedding"
+                    );
+                }
+            }
+        }
+
+        TextEmbedding::try_new_from_user_defined(model, InitOptionsUserDefined::new()).map_err(
+            |e| EmbedderError::EmbeddingFailed {
+                model: embedder_id.to_string(),
+                source: Box::new(std::io::Error::other(format!("fastembed init failed: {e}"))),
+            },
+        )
+    }
+
+    #[cfg(windows)]
+    fn init_text_embedding_directml(
+        model: UserDefinedEmbeddingModel,
+    ) -> anyhow::Result<TextEmbedding> {
+        use ort::ep::directml::PerformancePreference;
+
+        let mut ep = ort::ep::DirectML::default()
+            .with_performance_preference(PerformancePreference::HighPerformance);
+        if let Some(device_id) = dotenvy::var("CASS_SEMANTIC_GPU_DEVICE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<i32>().ok())
+        {
+            ep = ep.with_device_id(device_id);
+        }
+
+        // error_on_failure: without it ort silently falls back to CPU on
+        // registration failure, which would report GPU mode while running on CPU.
+        let options = InitOptionsUserDefined::new()
+            .with_execution_providers(vec![ep.build().error_on_failure()]);
+        TextEmbedding::try_new_from_user_defined(model, options)
+    }
+
     fn read_required(path: PathBuf, label: &str, model_id: &str) -> EmbedderResult<Vec<u8>> {
         fs::read(&path).map_err(|e| {
             Self::unavailable_error(
@@ -325,6 +377,21 @@ impl FastEmbedder {
             embedding.fill(0.0);
         }
     }
+}
+
+/// True when the operator has opted in to GPU embedding via CASS_SEMANTIC_GPU.
+///
+/// Accepted truthy values: 1, true, on, yes (case-insensitive). CPU is the
+/// default; GPU is only attempted when explicitly requested.
+pub fn semantic_gpu_requested() -> bool {
+    dotenvy::var("CASS_SEMANTIC_GPU")
+        .map(|raw| {
+            matches!(
+                raw.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+        .unwrap_or(false)
 }
 
 pub fn model_dir_override() -> Option<PathBuf> {
