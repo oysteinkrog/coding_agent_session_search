@@ -635,6 +635,64 @@ mod tests {
         );
     }
 
+    /// CPU/GPU embedding parity and throughput on the real model.
+    ///
+    /// Ignored by default: needs model files on disk. Run with:
+    /// `FRANKENSEARCH_MODEL_DIR=<model dir> cargo test --release \
+    ///   gpu_cpu_parity_and_throughput -- --ignored --nocapture`
+    /// On non-Windows (or without CASS_SEMANTIC_GPU support) both embedders
+    /// run on CPU and the parity assertion passes trivially.
+    #[test]
+    #[serial]
+    #[ignore = "requires local model files (set FRANKENSEARCH_MODEL_DIR)"]
+    fn gpu_cpu_parity_and_throughput() {
+        let Some(model_dir) = model_dir_override() else {
+            eprintln!("FRANKENSEARCH_MODEL_DIR not set; skipping");
+            return;
+        };
+
+        unsafe { std::env::remove_var("CASS_SEMANTIC_GPU") };
+        let cpu = FastEmbedder::load_from_dir(&model_dir).expect("cpu embedder");
+        unsafe { std::env::set_var("CASS_SEMANTIC_GPU", "1") };
+        let gpu = FastEmbedder::load_from_dir(&model_dir).expect("gpu embedder");
+        unsafe { std::env::remove_var("CASS_SEMANTIC_GPU") };
+
+        // Embeddings are normalized, so the dot product is the cosine.
+        let long_chunk =
+            "Long-form conversation chunk about debugging a Rust deadlock in the indexer. "
+                .repeat(30);
+        let samples = [
+            "fn main() { println!(\"hello world\"); }",
+            "The daemon retries the backfill batch after an idle gate check.",
+            "error[E0308]: mismatched types expected `&str`, found `String`",
+            long_chunk.as_str(),
+        ];
+        for text in &samples {
+            let a = cpu.embed_sync(text).expect("cpu embed");
+            let b = gpu.embed_sync(text).expect("gpu embed");
+            let cos: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+            eprintln!("cosine={cos:.6} len={}", text.len());
+            assert!(cos > 0.999, "CPU/GPU embedding divergence: cosine={cos}");
+        }
+
+        // Throughput: identical batch on both embedders, with warmup.
+        let chunk = "Realistic session chunk: the agent edited src/indexer/semantic.rs, \
+                     ran cargo test, and committed the fix after the checkpoint advanced. "
+            .repeat(8);
+        let batch: Vec<&str> = vec![chunk.as_str(); 256];
+        for (label, embedder) in [("cpu", &cpu), ("gpu", &gpu)] {
+            embedder.embed_batch_sync(&batch[..8]).expect("warmup");
+            let start = std::time::Instant::now();
+            embedder.embed_batch_sync(&batch).expect("batch embed");
+            let secs = start.elapsed().as_secs_f64();
+            eprintln!(
+                "{label}: {} chunks in {secs:.2}s = {:.1} chunks/s",
+                batch.len(),
+                batch.len() as f64 / secs
+            );
+        }
+    }
+
     #[test]
     #[serial]
     fn runtime_model_dir_honors_frankensearch_override_and_expands_home() {
