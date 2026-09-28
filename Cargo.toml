@@ -138,6 +138,13 @@ openssl = { version = "0.10.79", features = ["vendored"] }
 fastembed = { version = "5.13.4", default-features = false, features = ["ort-download-binaries-rustls-tls", "directml"] }
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["directml"] }
 
+# CUDA GPU execution provider on Linux, same CASS_SEMANTIC_GPU=1 opt-in. The ort
+# "cuda" feature makes the build download the CUDA onnxruntime binaries (cu12 or
+# cu13, picked from nvcc or ORT_CUDA_VERSION). At runtime the CUDA and cuDNN 9
+# libraries must be installed (Arch: pacman -S cuda cudnn).
+[target.'cfg(target_os = "linux")'.dependencies]
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["cuda"] }
+
 [features]
 default = ["qr", "encryption"]
 qr = ["dep:qrcode", "dep:image"]

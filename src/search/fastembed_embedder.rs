@@ -294,7 +294,7 @@ impl FastEmbedder {
     ///
     /// GPU init failure falls back to CPU with a logged warning; it never
     /// propagates as an error so indexing keeps working on machines where
-    /// DirectML is unavailable.
+    /// DirectML (Windows) or CUDA (Linux) is unavailable.
     fn init_text_embedding(
         model: UserDefinedEmbeddingModel,
         embedder_id: &str,
@@ -314,6 +314,26 @@ impl FastEmbedder {
                         embedder = embedder_id,
                         error = %e,
                         "DirectML GPU init failed; falling back to CPU embedding"
+                    );
+                }
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        if semantic_gpu_requested() {
+            match Self::init_text_embedding_cuda(model.clone()) {
+                Ok(session) => {
+                    tracing::info!(
+                        embedder = embedder_id,
+                        "semantic embedder running on CUDA GPU (CASS_SEMANTIC_GPU)"
+                    );
+                    return Ok(session);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        embedder = embedder_id,
+                        error = %e,
+                        "CUDA GPU init failed; falling back to CPU embedding"
                     );
                 }
             }
@@ -344,6 +364,23 @@ impl FastEmbedder {
 
         // error_on_failure: without it ort silently falls back to CPU on
         // registration failure, which would report GPU mode while running on CPU.
+        let options = InitOptionsUserDefined::new()
+            .with_execution_providers(vec![ep.build().error_on_failure()]);
+        TextEmbedding::try_new_from_user_defined(model, options)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn init_text_embedding_cuda(model: UserDefinedEmbeddingModel) -> anyhow::Result<TextEmbedding> {
+        let mut ep = ort::ep::CUDA::default();
+        if let Some(device_id) = dotenvy::var("CASS_SEMANTIC_GPU_DEVICE")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<i32>().ok())
+        {
+            ep = ep.with_device_id(device_id);
+        }
+
+        // error_on_failure: same reason as DirectML. Without it a missing CUDA or
+        // cuDNN library would silently run on CPU while reporting GPU mode.
         let options = InitOptionsUserDefined::new()
             .with_execution_providers(vec![ep.build().error_on_failure()]);
         TextEmbedding::try_new_from_user_defined(model, options)
