@@ -55,7 +55,14 @@ mod shard_publication_tests;
 /// bound on a batch: [`DEFAULT_SEMANTIC_EMBED_BATCH_CHAR_BUDGET`] additionally
 /// caps `row_count × max_canonical_len` so a batch that happens to contain a
 /// long message holds proportionally fewer rows (cass #309).
+#[cfg(not(feature = "cuda"))]
 const DEFAULT_SEMANTIC_BATCH_SIZE: usize = 128;
+/// Fork-only `cuda` builds: the GPU embedder sorts each batch by length and
+/// splits it by its own token budget, so large batches cost no extra padding
+/// and keep the GPU busy. 128-row batches ran at about half the GPU's
+/// throughput in the port benchmark.
+#[cfg(feature = "cuda")]
+const DEFAULT_SEMANTIC_BATCH_SIZE: usize = 1024;
 /// Default per-batch canonical-character budget for length-aware embed
 /// batching (cass #309). A fixed-size batch (128) padded to its longest member
 /// makes the ONNX embedder allocate a `batch × max_seq²` attention tensor, so a
@@ -66,7 +73,13 @@ const DEFAULT_SEMANTIC_BATCH_SIZE: usize = 128;
 /// case is ≈8 rows — the regime that embeds cleanly (<1 GB) in practice. Set
 /// `CASS_SEMANTIC_EMBED_BATCH_CHAR_BUDGET=0` to disable (fixed `batch_size`
 /// chunks, pre-#309 behavior).
+#[cfg(not(feature = "cuda"))]
 const DEFAULT_SEMANTIC_EMBED_BATCH_CHAR_BUDGET: usize = 16 * 1024;
+/// Fork-only `cuda` builds: 1024 rows at the 2,000-char embed cap. The GPU
+/// embedder bounds its own padded working set, and the CPU F32 fallback
+/// already splits batches at 2,048 tokens internally.
+#[cfg(feature = "cuda")]
+const DEFAULT_SEMANTIC_EMBED_BATCH_CHAR_BUDGET: usize = 2 * 1024 * 1024;
 const DEFAULT_SEMANTIC_PREP_MEMO_CAPACITY: usize = 4_096;
 const DEFAULT_SEMANTIC_EMBED_BATCH_WARN_AFTER_MS: u64 = 30_000;
 const DEFAULT_SEMANTIC_EMBED_BATCH_FAIL_AFTER_MS: u64 = 300_000;
