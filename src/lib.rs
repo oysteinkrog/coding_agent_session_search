@@ -1676,8 +1676,19 @@ pub enum Commands {
     /// are kept: a source that changes afterwards is indexed again.
     Forget {
         /// Glob over conversation `source_path` (e.g. `**/subagents/*.jsonl`).
-        #[arg(long = "source-glob")]
-        source_glob: String,
+        #[arg(
+            long = "source-glob",
+            required_unless_present = "source_list",
+            conflicts_with = "source_list"
+        )]
+        source_glob: Option<String>,
+
+        /// File with one exact conversation `source_path` per line. Use it
+        /// instead of `--source-glob` to forget an arbitrary set of
+        /// conversations in one run (one lexical rebuild). Empty lines are
+        /// skipped.
+        #[arg(long = "source-list", value_name = "FILE")]
+        source_list: Option<PathBuf>,
 
         /// Override db path
         #[arg(long)]
@@ -9188,12 +9199,20 @@ async fn execute_cli(
                 }
                 Commands::Forget {
                     source_glob,
+                    source_list,
                     db,
                     apply,
                     json,
                 } => {
                     let structured_format = resolve_subcommand_structured_format(cli, json);
-                    run_forget_command(source_glob, db, apply, cli, structured_format)?;
+                    let selector = match (source_glob, source_list) {
+                        (Some(glob), _) => ForgetSelector::Glob(glob),
+                        (None, Some(list)) => ForgetSelector::List(list),
+                        (None, None) => {
+                            unreachable!("clap requires --source-glob or --source-list")
+                        }
+                    };
+                    run_forget_command(selector, db, apply, cli, structured_format)?;
                 }
                 Commands::Mirror(subcmd) => {
                     run_mirror_command(subcmd, cli)?;
@@ -9750,14 +9769,53 @@ fn run_quarantine_clear(
 /// conversations by source-path glob (#292 ask #2). Dry-run by default;
 /// `--apply` deletes the matching rows from the canonical DB and rebuilds the
 /// derived search/analytics assets so search coverage stays consistent.
+/// Which conversations `cass forget` selects.
+enum ForgetSelector {
+    /// `--source-glob <pat>`
+    Glob(String),
+    /// `--source-list <file>`: one exact `source_path` per line.
+    List(PathBuf),
+}
+
+fn read_forget_source_list(path: &Path) -> CliResult<Vec<String>> {
+    let text = std::fs::read_to_string(path).map_err(|e| CliError {
+        code: 2,
+        kind: "forget",
+        message: format!("failed to read --source-list {}: {e}", path.display()),
+        hint: None,
+        retryable: false,
+    })?;
+    let paths: Vec<String> = text
+        .lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    if paths.is_empty() {
+        return Err(CliError {
+            code: 2,
+            kind: "forget",
+            message: format!("--source-list {} has no paths", path.display()),
+            hint: None,
+            retryable: false,
+        });
+    }
+    Ok(paths)
+}
+
 fn run_forget_command(
-    source_glob: String,
+    selector: ForgetSelector,
     db_override: Option<PathBuf>,
     apply: bool,
     cli: &Cli,
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
     use crate::storage::sqlite::FrankenStorage;
+
+    let source_list = match &selector {
+        ForgetSelector::List(path) => Some(read_forget_source_list(path)?),
+        ForgetSelector::Glob(_) => None,
+    };
 
     let db_path = db_override
         .or_else(|| cli.db.clone())
@@ -9802,18 +9860,23 @@ fn run_forget_command(
         retryable: false,
     })?;
 
-    let report = storage
-        .forget_conversations_by_source_glob(&source_glob, !apply)
-        .map_err(|e| CliError {
-            code: 5,
-            kind: "forget",
-            message: format!("forget failed: {e}"),
-            hint: Some(
-                "Run `cass forget --source-glob <pat> --json` (dry-run) first to inspect matches."
-                    .to_string(),
-            ),
-            retryable: false,
-        })?;
+    let report = match (&selector, &source_list) {
+        (_, Some(paths)) => storage.forget_conversations_by_source_paths(paths, !apply),
+        (ForgetSelector::Glob(glob), None) => {
+            storage.forget_conversations_by_source_glob(glob, !apply)
+        }
+        (ForgetSelector::List(_), None) => unreachable!("source list is read above"),
+    }
+    .map_err(|e| CliError {
+        code: 5,
+        kind: "forget",
+        message: format!("forget failed: {e}"),
+        hint: Some(
+            "Run `cass forget --source-glob <pat> --json` (dry-run) first to inspect matches."
+                .to_string(),
+        ),
+        retryable: false,
+    })?;
 
     // After an actual deletion every derived surface that stores message text
     // or counts must stop serving the forgotten conversations, exactly as on

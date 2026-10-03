@@ -10930,10 +10930,43 @@ impl FrankenStorage {
         }
         let glob = glob::Pattern::new(trimmed)
             .with_context(|| format!("invalid forget source-glob pattern: {trimmed}"))?;
+        self.forget_conversations_matching(trimmed, dry_run, |path| glob.matches(path))
+    }
 
-        // Pull (id, source_path) for every conversation and match the glob in
-        // Rust. source_path may be NULL on legacy rows; those never match a
-        // path glob.
+    /// Like [`Self::forget_conversations_by_source_glob`], but matches an
+    /// exact set of `source_path` values. A glob cannot name an arbitrary
+    /// subset (for example one copy of each duplicated session), and one
+    /// forget per path would rebuild the lexical index once per path.
+    pub fn forget_conversations_by_source_paths(
+        &self,
+        paths: &[String],
+        dry_run: bool,
+    ) -> Result<ForgetConversationsResult> {
+        let wanted: HashSet<&str> = paths
+            .iter()
+            .map(String::as_str)
+            .filter(|path| !path.is_empty())
+            .collect();
+        if wanted.is_empty() {
+            return Err(anyhow!("forget source list cannot be empty"));
+        }
+        let label = format!("source list ({} paths)", wanted.len());
+        self.forget_conversations_matching(&label, dry_run, |path| wanted.contains(path))
+    }
+
+    /// Number of conversation ids per `IN (...)` list, so a forget of tens of
+    /// thousands of conversations does not build one giant statement. Tests
+    /// use 2 so the chunked path runs with a handful of rows.
+    const FORGET_ID_CHUNK: usize = if cfg!(test) { 2 } else { 2_000 };
+
+    fn forget_conversations_matching(
+        &self,
+        label: &str,
+        dry_run: bool,
+        matches: impl Fn(&str) -> bool,
+    ) -> Result<ForgetConversationsResult> {
+        // Pull (id, source_path) for every conversation and match in Rust.
+        // source_path may be NULL on legacy rows; those never match.
         let rows: Vec<(i64, Option<String>)> = self.conn.query_map_collect(
             "SELECT id, source_path FROM conversations ORDER BY id",
             fparams![],
@@ -10950,7 +10983,7 @@ impl FrankenStorage {
         let mut matched_paths: BTreeSet<String> = BTreeSet::new();
         for (id, source_path) in rows {
             let Some(path) = source_path else { continue };
-            if glob.matches(&path) {
+            if matches(&path) {
                 matched_ids.push(id);
                 if sample_paths.len() < 20 {
                     sample_paths.push(path.clone());
@@ -10961,7 +10994,7 @@ impl FrankenStorage {
 
         if matched_ids.is_empty() {
             return Ok(ForgetConversationsResult {
-                pattern: trimmed.to_string(),
+                pattern: label.to_string(),
                 dry_run,
                 conversations_matched: 0,
                 messages_matched: 0,
@@ -10970,21 +11003,30 @@ impl FrankenStorage {
             });
         }
 
-        let id_list = matched_ids
-            .iter()
-            .map(i64::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
+        let id_lists: Vec<String> = matched_ids
+            .chunks(Self::FORGET_ID_CHUNK)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .collect();
 
-        let messages_matched: i64 = self.conn.query_row_map(
-            &format!("SELECT COUNT(*) FROM messages WHERE conversation_id IN ({id_list})"),
-            fparams![],
-            |row| row.get_typed(0),
-        )?;
+        let mut messages_matched: i64 = 0;
+        for id_list in &id_lists {
+            let count: i64 = self.conn.query_row_map(
+                &format!("SELECT COUNT(*) FROM messages WHERE conversation_id IN ({id_list})"),
+                fparams![],
+                |row| row.get_typed(0),
+            )?;
+            messages_matched = messages_matched.saturating_add(count);
+        }
 
         if dry_run {
             return Ok(ForgetConversationsResult {
-                pattern: trimmed.to_string(),
+                pattern: label.to_string(),
                 dry_run,
                 conversations_matched: matched_ids.len(),
                 messages_matched: messages_matched.max(0) as usize,
@@ -10994,24 +11036,26 @@ impl FrankenStorage {
         }
 
         let mut tx = self.conn.transaction()?;
-        // Non-cascading external-lookup tables first (mirrors agent purge).
-        tx.execute_compat(
-            &format!(
-                "DELETE FROM conversation_external_lookup WHERE conversation_id IN ({id_list})"
-            ),
-            fparams![],
-        )?;
-        tx.execute_compat(
-            &format!(
-                "DELETE FROM conversation_external_tail_lookup WHERE conversation_id IN ({id_list})"
-            ),
-            fparams![],
-        )?;
-        // The remaining child tables (messages, snippets, tags, ...) cascade.
-        tx.execute_compat(
-            &format!("DELETE FROM conversations WHERE id IN ({id_list})"),
-            fparams![],
-        )?;
+        for id_list in &id_lists {
+            // Non-cascading external-lookup tables first (mirrors agent purge).
+            tx.execute_compat(
+                &format!(
+                    "DELETE FROM conversation_external_lookup WHERE conversation_id IN ({id_list})"
+                ),
+                fparams![],
+            )?;
+            tx.execute_compat(
+                &format!(
+                    "DELETE FROM conversation_external_tail_lookup WHERE conversation_id IN ({id_list})"
+                ),
+                fparams![],
+            )?;
+            // The remaining child tables (messages, snippets, tags, ...) cascade.
+            tx.execute_compat(
+                &format!("DELETE FROM conversations WHERE id IN ({id_list})"),
+                fparams![],
+            )?;
+        }
         clear_semantic_embed_watermark_after_deletion(&tx)?;
         // Tombstone every forgotten source so a later scan (triggered by any
         // sibling change) does not ingest it again while it is unchanged.
@@ -11033,7 +11077,7 @@ impl FrankenStorage {
         tx.commit()?;
 
         Ok(ForgetConversationsResult {
-            pattern: trimmed.to_string(),
+            pattern: label.to_string(),
             dry_run,
             conversations_matched: matched_ids.len(),
             messages_matched: messages_matched.max(0) as usize,
@@ -44463,6 +44507,111 @@ sys.exit('stock writer does not own WAL_WRITE_LOCK')
             storage.get_last_embedded_message_id().unwrap(),
             Some(max_message_id),
             "a no-op forget must not force a semantic re-embed"
+        );
+    }
+
+    /// `cass forget --source-list`: forgets exactly the listed source paths,
+    /// across several id chunks, in one call.
+    #[test]
+    fn forget_conversations_by_source_paths_matches_exact_set() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("forget-list.db");
+        let storage = FrankenStorage::open(&db_path).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "claude".into(),
+                name: "claude".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+        let path = |i: usize| format!("/home/u/.claude/projects/-c-p/sess-{i}.jsonl");
+        for i in 0..7 {
+            let conversation = Conversation {
+                id: None,
+                agent_slug: "claude".into(),
+                workspace: Some(PathBuf::from("/tmp/workspace")),
+                external_id: Some(format!("sess-{i}")),
+                title: Some(format!("session {i}")),
+                source_path: PathBuf::from(path(i)),
+                started_at: Some(1_700_000_000_000),
+                ended_at: Some(1_700_000_000_100),
+                approx_tokens: None,
+                metadata_json: serde_json::Value::Null,
+                messages: (0..2)
+                    .map(|idx| Message {
+                        id: None,
+                        idx,
+                        role: MessageRole::User,
+                        author: Some("user".into()),
+                        created_at: Some(1_700_000_000_010),
+                        content: format!("session {i} message {idx}"),
+                        extra_json: serde_json::Value::Null,
+                        snippets: Vec::new(),
+                    })
+                    .collect(),
+                source_id: LOCAL_SOURCE_ID.into(),
+                origin_host: None,
+            };
+            storage
+                .insert_conversation_tree(agent_id, None, &conversation)
+                .unwrap();
+        }
+        assert_eq!(storage.total_conversation_count().unwrap(), 7);
+
+        // Five listed paths (more than two id chunks), one duplicate line, one
+        // path that is not indexed, one empty line.
+        let list: Vec<String> = vec![
+            path(0),
+            path(2),
+            path(3),
+            path(5),
+            path(6),
+            path(6),
+            "/not/indexed.jsonl".to_string(),
+            String::new(),
+        ];
+
+        let dry = storage
+            .forget_conversations_by_source_paths(&list, true)
+            .unwrap();
+        assert!(dry.dry_run);
+        assert_eq!(dry.conversations_matched, 5);
+        assert_eq!(dry.messages_matched, 10);
+        assert_eq!(dry.conversations_deleted, 0);
+        assert_eq!(storage.total_conversation_count().unwrap(), 7);
+        assert!(storage.forgotten_source_stamps().unwrap().is_empty());
+
+        let applied = storage
+            .forget_conversations_by_source_paths(&list, false)
+            .unwrap();
+        assert_eq!(applied.conversations_deleted, 5);
+        assert_eq!(storage.total_conversation_count().unwrap(), 2);
+        assert_eq!(storage.total_message_count().unwrap(), 4);
+        let survivors: BTreeSet<String> = storage
+            .raw()
+            .query_map_collect("SELECT source_path FROM conversations", fparams![], |row| {
+                row.get_typed::<String>(0)
+            })
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(survivors, BTreeSet::from([path(1), path(4)]));
+        let tombstones = storage.forgotten_source_stamps().unwrap();
+        assert_eq!(
+            tombstones.keys().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from([path(0), path(2), path(3), path(5), path(6)])
+        );
+
+        // An empty list is rejected.
+        assert!(
+            storage
+                .forget_conversations_by_source_paths(&[String::new()], true)
+                .is_err()
         );
     }
 
