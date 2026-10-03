@@ -4,7 +4,8 @@
 //! the upstream frankensearch F32 MiniLM producer (`AllMiniLmL6V2F32`) on the
 //! CPU. That producer owns the embedding identity, embeds single texts
 //! (queries), and is the fallback. Batches of at least `CASS_CUDA_MIN_BATCH`
-//! texts (default 8) go to a candle BERT on the GPU instead.
+//! texts (default 8) go to a candle BERT on the GPU instead
+//! (`cuda_minibert.rs`).
 //!
 //! The GPU is started lazily, on the first large batch, so a short-lived
 //! search process never touches CUDA. At start the GPU output for a fixed set
@@ -27,7 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
-use candle_transformers::models::bert::{BertModel, Config};
+use super::cuda_minibert::{BertConfig, MiniBert};
 use cuda_tokenizers::Tokenizer;
 use frankensearch::NativeEmbedder;
 use frankensearch::core::traits::SyncEmbed;
@@ -152,7 +153,7 @@ fn start_checked(model_dir: &Path, reference: &NativeEmbedder) -> Result<(CudaMi
 /// when the norm is above zero. Batches are padded and masked, so padding
 /// never enters the mean. The math is plain f32 (no TF32, no f16).
 pub(crate) struct CudaMiniLm {
-    model: Mutex<BertModel>,
+    model: Mutex<MiniBert>,
     device: Device,
     tokenizer: Tokenizer,
     token_budget: usize,
@@ -169,13 +170,10 @@ impl CudaMiniLm {
         let device = Device::new_cuda(ordinal).map_err(|e| err("cuda device", e))?;
         let config_text = std::fs::read_to_string(model_dir.join("config.json"))
             .map_err(|e| err("read config.json", e))?;
-        let config: Config =
-            serde_json::from_str(&config_text).map_err(|e| err("parse config.json", e))?;
-        if config.hidden_size != DIM {
-            return Err(format!(
-                "config.json hidden_size {} is not {DIM}",
-                config.hidden_size
-            ));
+        let config =
+            BertConfig::from_json(&config_text).map_err(|e| err("parse config.json", e))?;
+        if config.hidden != DIM {
+            return Err(format!("config.json hidden_size {} is not {DIM}", config.hidden));
         }
         let mut tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .map_err(|e| err("load tokenizer.json", e))?;
@@ -192,7 +190,7 @@ impl CudaMiniLm {
         // manifest; candle copies the tensors to the device during load.
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, &device) }
             .map_err(|e| err("map model.safetensors", e))?;
-        let model = BertModel::load(vb, &config).map_err(|e| err("build BertModel", e))?;
+        let model = MiniBert::load(vb, config).map_err(|e| err("build MiniBert", e))?;
         let token_budget = dotenvy::var("CASS_CUDA_TOKEN_BUDGET")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
@@ -257,7 +255,7 @@ impl CudaMiniLm {
             .collect()
     }
 
-    fn forward_chunk(&self, model: &BertModel, rows: &[&[u32]]) -> Result<Vec<Vec<f32>>, String> {
+    fn forward_chunk(&self, model: &MiniBert, rows: &[&[u32]]) -> Result<Vec<Vec<f32>>, String> {
         let n = rows.len();
         let len = rows.iter().map(|r| r.len()).max().unwrap_or(0).max(1);
         let mut id_buf = vec![0u32; n * len];
@@ -268,9 +266,9 @@ impl CudaMiniLm {
         }
         let run = || -> candle_core::Result<Vec<Vec<f32>>> {
             let input_ids = Tensor::from_vec(id_buf, (n, len), &self.device)?;
-            let type_ids = input_ids.zeros_like()?;
             let mask = Tensor::from_vec(mask_buf, (n, len), &self.device)?;
-            let hidden = model.forward(&input_ids, &type_ids, Some(&mask))?; // [n, len, 384]
+            let padded = rows.iter().any(|r| r.len() != len);
+            let hidden = model.forward(&input_ids, padded.then_some(&mask))?; // [n, len, 384]
             let summed = hidden.broadcast_mul(&mask.unsqueeze(2)?)?.sum(1)?; // [n, 384]
             let counts = mask.sum_keepdim(1)?; // [n, 1]
             summed.broadcast_div(&counts)?.to_vec2::<f32>()
