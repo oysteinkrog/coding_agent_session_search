@@ -130,7 +130,6 @@ bytemuck = "1.25.0"
 # quality embedder. Off by default; the default build stays pure-Rust CPU.
 candle-core = { version = "0.11.0", default-features = false, optional = true }
 candle-nn = { version = "0.11.0", default-features = false, optional = true }
-candle-transformers = { version = "0.11.0", default-features = false, optional = true }
 cuda-tokenizers = { package = "tokenizers", version = "0.23.2", default-features = false, features = ["fancy-regex"], optional = true }
 # Semantic embedding + reranking are PURE-RUST via frankensearch's `native`
 # feature: the frankentorch all-MiniLM-L6-v2 baseline plus the explicit
@@ -221,11 +220,9 @@ strict-path-dep-validation = []
 cuda = [
     "dep:candle-core",
     "dep:candle-nn",
-    "dep:candle-transformers",
     "dep:cuda-tokenizers",
     "candle-core/cuda",
     "candle-nn/cuda",
-    "candle-transformers/cuda",
 ]
 # Internal, in-memory seam for feeding engine-ranked message identities through
 # the production CASS SQLite message projector and result reducer. This does not
