@@ -534,6 +534,33 @@ impl Embedder for FastEmbedder {
 mod tests {
     use super::*;
 
+    /// Needs a GPU and a MiniLM model dir in `CASS_TEST_MINILM_DIR`; skipped otherwise.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_batches_match_the_cpu_f32_producer() {
+        let Ok(dir) = std::env::var("CASS_TEST_MINILM_DIR") else {
+            eprintln!("skipped: CASS_TEST_MINILM_DIR not set");
+            return;
+        };
+        let embedder = FastEmbedder::load_from_dir(Path::new(&dir)).expect("load minilm");
+        let owned: Vec<String> = (0..64)
+            .map(|i| format!("message {i}: the indexer wrote shard {i}. ").repeat(1 + i % 40))
+            .collect();
+        let texts: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let batch = embedder.embed_batch_sync(&texts).expect("batch embed");
+        let cuda = embedder.cuda.as_ref().expect("minilm has a cuda path");
+        assert!(cuda.is_active(), "GPU did not start or failed its start check");
+        let cpu = embedder.inner.embed_batch_sync(&texts).expect("cpu embed");
+        let diff = super::super::cuda_embedder::max_abs_diff(&batch, &cpu).expect("same shape");
+        assert!(diff <= 1.0e-4, "GPU differs from CPU F32 by {diff:e}");
+        // Single texts (queries) stay on the CPU producer, bit for bit.
+        assert_eq!(embedder.embed_sync(texts[3]).unwrap(), cpu[3]);
+        assert_eq!(
+            embedder.identity().unwrap(),
+            frankensearch::core::traits::SyncEmbed::identity(&embedder.inner).unwrap()
+        );
+    }
+
     #[test]
     fn missing_files_returns_unavailable() {
         let tmp = tempfile::tempdir().expect("tempdir");

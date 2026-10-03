@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use super::cuda_minibert::{BertConfig, MiniBert};
-use cuda_tokenizers::Tokenizer;
+use tokenizers::Tokenizer;
 use frankensearch::NativeEmbedder;
 use frankensearch::core::traits::SyncEmbed;
 
@@ -71,6 +71,11 @@ impl CudaAccel {
             disabled: AtomicBool::new(off),
             min_batch,
         }
+    }
+
+    /// True once the GPU has started and passed the start check.
+    pub(crate) fn is_active(&self) -> bool {
+        !self.disabled.load(Ordering::Relaxed) && matches!(self.state.get(), Some(Some(_)))
     }
 
     /// Embed on the GPU, or return `None` so the caller uses the CPU producer.
@@ -178,18 +183,19 @@ impl CudaMiniLm {
         let mut tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .map_err(|e| err("load tokenizer.json", e))?;
         tokenizer
-            .with_truncation(Some(cuda_tokenizers::TruncationParams {
+            .with_truncation(Some(tokenizers::TruncationParams {
                 max_length: MAX_LENGTH,
                 ..Default::default()
             }))
             .map_err(|e| err("tokenizer truncation", e))?;
         tokenizer.with_padding(None);
 
-        let weights = model_dir.join("model.safetensors");
-        // SAFETY: the file is mapped read-only and was hash-checked by the
-        // manifest; candle copies the tensors to the device during load.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, &device) }
-            .map_err(|e| err("map model.safetensors", e))?;
+        // Read (not mmap) the weights: cass denies unsafe code, and the file is
+        // only 91 MB. The manifest check has already hashed it.
+        let weights = std::fs::read(model_dir.join("model.safetensors"))
+            .map_err(|e| err("read model.safetensors", e))?;
+        let vb = VarBuilder::from_buffered_safetensors(weights, DType::F32, &device)
+            .map_err(|e| err("parse model.safetensors", e))?;
         let model = MiniBert::load(vb, config).map_err(|e| err("build MiniBert", e))?;
         let token_budget = dotenvy::var("CASS_CUDA_TOKEN_BUDGET")
             .ok()
