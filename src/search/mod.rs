@@ -34,6 +34,8 @@ pub mod e2e_scenarios;
 pub mod embedder;
 pub mod embedder_registry;
 pub mod fastembed_embedder;
+#[cfg(feature = "cuda")]
+pub(crate) mod cuda_embedder;
 pub mod fastembed_reranker;
 pub(crate) mod fleet_cheap_probes;
 pub mod hash_embedder;
