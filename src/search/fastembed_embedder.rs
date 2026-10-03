@@ -54,8 +54,16 @@ const MINILM_DIMENSION: usize = 384;
 /// same-shape vectors from being mixed silently. The CASS passage suffix also
 /// fences prefix-only indexes from the current bounded input representation;
 /// the model weights and their artifact revision are unchanged.
+#[cfg(not(feature = "cuda"))]
 pub const MINILM_VECTOR_SPACE_REVISION: &str =
     "native-minilm-v1:c9745ed1d9f207416be6d2e6f8de32d1f16199bf:passages-v2";
+
+/// Fork-only `cuda` builds use the F32 MiniLM producer (CPU, with batches on
+/// the GPU), so their vectors get their own revision and are never mixed with
+/// an int8-produced index.
+#[cfg(feature = "cuda")]
+pub const MINILM_VECTOR_SPACE_REVISION: &str =
+    "native-minilm-f32-v1:c9745ed1d9f207416be6d2e6f8de32d1f16199bf:passages-v2";
 
 /// FSVI vector-space revision for the opt-in multilingual native model.
 ///
@@ -102,6 +110,9 @@ pub struct FastEmbedder {
     id: String,
     model_id: String,
     dimension: usize,
+    /// GPU batch path for the MiniLM L6 producer in `cuda` builds.
+    #[cfg(feature = "cuda")]
+    cuda: Option<super::cuda_embedder::CudaAccel>,
 }
 
 /// Metadata-stable, on-demand wrapper for the local quality embedder.
@@ -295,7 +306,12 @@ impl FastEmbedder {
     /// profiles are supported; all other model IDs or dimensions are rejected.
     pub fn load_with_config(model_dir: &Path, config: OnnxEmbedderConfig) -> EmbedderResult<Self> {
         let profile = match (config.model_id.as_str(), config.dimension) {
+            #[cfg(not(feature = "cuda"))]
             (MINILM_MODEL_ID, MINILM_DIMENSION) => NativeEmbeddingModel::AllMiniLmL6V2,
+            // The GPU path matches the F32 producer to float rounding; it cannot
+            // match the int8 one, so `cuda` builds use F32 on the CPU as well.
+            #[cfg(feature = "cuda")]
+            (MINILM_MODEL_ID, MINILM_DIMENSION) => NativeEmbeddingModel::AllMiniLmL6V2F32,
             (MULTILINGUAL_MINILM_MODEL_ID, MINILM_DIMENSION) => {
                 NativeEmbeddingModel::ParaphraseMultilingualMiniLmL12V2
             }
@@ -346,11 +362,16 @@ impl FastEmbedder {
                 ),
             ));
         }
+        #[cfg(feature = "cuda")]
+        let cuda = matches!(profile, NativeEmbeddingModel::AllMiniLmL6V2F32)
+            .then(|| super::cuda_embedder::CudaAccel::new(model_dir));
         Ok(Self {
             inner,
             id: config.embedder_id,
             model_id: config.model_id,
             dimension,
+            #[cfg(feature = "cuda")]
+            cuda,
         })
     }
 
@@ -465,6 +486,15 @@ impl Embedder for FastEmbedder {
         }
         if texts.is_empty() {
             return Ok(Vec::new());
+        }
+        #[cfg(feature = "cuda")]
+        if let Some(vectors) = self
+            .cuda
+            .as_ref()
+            .and_then(|cuda| cuda.try_embed(&self.inner, texts))
+        {
+            self.validate_output(&vectors, texts.len())?;
+            return Ok(vectors);
         }
         let vectors = self.inner.embed_batch_sync(texts)?;
         self.validate_output(&vectors, texts.len())?;
