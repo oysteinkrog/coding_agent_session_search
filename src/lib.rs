@@ -1690,6 +1690,14 @@ pub enum Commands {
         #[arg(long = "source-list", value_name = "FILE")]
         source_list: Option<PathBuf>,
 
+        /// With `--apply`: delete the rows and write tombstones, but skip the
+        /// FTS, analytics and lexical rebuilds. For splitting one large forget
+        /// into batches: pass it on every batch except the last, which then
+        /// rebuilds once for all of them. Until that last batch runs, search
+        /// can still return the forgotten text.
+        #[arg(long = "no-rebuild", requires = "apply")]
+        no_rebuild: bool,
+
         /// Override db path
         #[arg(long)]
         db: Option<PathBuf>,
@@ -9200,6 +9208,7 @@ async fn execute_cli(
                 Commands::Forget {
                     source_glob,
                     source_list,
+                    no_rebuild,
                     db,
                     apply,
                     json,
@@ -9212,7 +9221,7 @@ async fn execute_cli(
                             unreachable!("clap requires --source-glob or --source-list")
                         }
                     };
-                    run_forget_command(selector, db, apply, cli, structured_format)?;
+                    run_forget_command(selector, db, apply, no_rebuild, cli, structured_format)?;
                 }
                 Commands::Mirror(subcmd) => {
                     run_mirror_command(subcmd, cli)?;
@@ -9807,6 +9816,7 @@ fn run_forget_command(
     selector: ForgetSelector,
     db_override: Option<PathBuf>,
     apply: bool,
+    no_rebuild: bool,
     cli: &Cli,
     output_format: Option<RobotFormat>,
 ) -> CliResult<()> {
@@ -9884,7 +9894,7 @@ fn run_forget_command(
     // until the lexical generation is rebuilt a plain search kept returning
     // the forgotten text (2l1b0.50). Failures are typed errors: a warning
     // with exit 0 would report success while the text stays searchable.
-    let remaining_conversations = if apply && report.conversations_deleted > 0 {
+    let remaining_conversations = if apply && !no_rebuild && report.conversations_deleted > 0 {
         let derived_error = |kind: CliErrorKind, surface: &str, error: anyhow::Error| {
             CliError {
             code: 5,
@@ -9994,6 +10004,10 @@ fn run_forget_command(
             obj.insert("schema_version".to_string(), serde_json::json!(1));
             obj.insert("applied".to_string(), serde_json::json!(apply));
             obj.insert(
+                "derived_rebuilt".to_string(),
+                serde_json::json!(apply && !no_rebuild && report.conversations_deleted > 0),
+            );
+            obj.insert(
                 "db_path".to_string(),
                 serde_json::json!(db_path.display().to_string()),
             );
@@ -10031,7 +10045,13 @@ fn run_forget_command(
         }
     }
     println!();
-    if apply {
+    if apply && no_rebuild {
+        println!(
+            "Deleted {} conversation(s) from the canonical DB. Derived assets were NOT rebuilt \
+             (--no-rebuild); run the last batch without it.",
+            report.conversations_deleted
+        );
+    } else if apply {
         println!(
             "Deleted {} conversation(s) from the canonical DB and rebuilt derived assets.",
             report.conversations_deleted

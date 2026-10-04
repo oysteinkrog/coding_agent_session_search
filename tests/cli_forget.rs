@@ -799,3 +799,95 @@ fn search_readers_open_across_a_forget_stop_returning_forgotten_text() -> TestRe
     }
     Ok(())
 }
+
+/// `cass forget --source-list --apply --no-rebuild` splits one large forget
+/// into batches: the early batches only delete rows, and the last batch,
+/// run without `--no-rebuild`, rebuilds the derived assets once for all.
+#[test]
+fn batched_source_list_forget_rebuilds_once_on_the_last_batch() -> TestResult {
+    const SECOND_MARKER: &str = "secondbatchmarkerepsilon";
+    let home = TempDir::new()?;
+    let data_dir = home.path().join("cass-data");
+    fs::create_dir_all(&data_dir)?;
+    let codex_home = home.path().join(".codex");
+    let first = write_codex_rollout(&codex_home, FORGOTTEN_SESSION, FORGOTTEN_MARKER)?;
+    let second = write_codex_rollout(&codex_home, "forget-c", SECOND_MARKER)?;
+    write_codex_rollout(&codex_home, "keep-b", KEPT_MARKER)?;
+    let archive = Archive { home, data_dir };
+    archive.index(&["--full"])?;
+    for marker in [FORGOTTEN_MARKER, SECOND_MARKER, KEPT_MARKER] {
+        if archive.search_hit_paths(marker)?.is_empty() {
+            return Err(format!("fixture not indexed: {marker}").into());
+        }
+    }
+
+    let list = |name: &str, path: &Path| -> TestResult<PathBuf> {
+        let file = archive.home.path().join(name);
+        fs::write(
+            &file,
+            format!("{}\n\n", path.to_str().ok_or("non-utf8 path")?),
+        )?;
+        Ok(file)
+    };
+    let first_list = list("batch-1.txt", &first)?;
+    let second_list = list("batch-2.txt", &second)?;
+    let first_list = first_list.to_str().ok_or("non-utf8 path")?;
+    let second_list = second_list.to_str().ok_or("non-utf8 path")?;
+
+    // --no-rebuild is only valid with --apply.
+    let rejected = archive.run_step(
+        "forget --no-rebuild without --apply",
+        archive.cmd(),
+        &[
+            "forget",
+            "--source-list",
+            first_list,
+            "--no-rebuild",
+            "--json",
+        ],
+    )?;
+    if rejected.status.success() {
+        return Err("--no-rebuild without --apply must be rejected".into());
+    }
+
+    // Batch 1: rows go, derived assets are left alone, so the lexical index
+    // still serves the text until the last batch.
+    let output = archive.succeed(
+        "forget batch 1 --no-rebuild",
+        &[
+            "forget",
+            "--source-list",
+            first_list,
+            "--apply",
+            "--no-rebuild",
+            "--json",
+        ],
+    )?;
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    if report["conversations_deleted"] != 1 || report["derived_rebuilt"] != false {
+        return Err(format!("unexpected batch 1 report: {report}").into());
+    }
+    if archive.search_hit_paths(FORGOTTEN_MARKER)?.is_empty() {
+        return Err("--no-rebuild must not rebuild the lexical index".into());
+    }
+
+    // Batch 2 (last): rebuilds once, which drops both batches from search.
+    let output = archive.succeed(
+        "forget batch 2",
+        &["forget", "--source-list", second_list, "--apply", "--json"],
+    )?;
+    let report: Value = serde_json::from_slice(&output.stdout)?;
+    if report["conversations_deleted"] != 1 || report["derived_rebuilt"] != true {
+        return Err(format!("unexpected batch 2 report: {report}").into());
+    }
+    for marker in [FORGOTTEN_MARKER, SECOND_MARKER] {
+        let hits = archive.search_hit_paths(marker)?;
+        if !hits.is_empty() {
+            return Err(format!("{marker} still searchable after the last batch: {hits:?}").into());
+        }
+    }
+    if archive.search_hit_paths(KEPT_MARKER)?.is_empty() {
+        return Err("batched forget removed an unrelated conversation".into());
+    }
+    Ok(())
+}
