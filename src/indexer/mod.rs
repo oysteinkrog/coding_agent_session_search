@@ -14110,11 +14110,30 @@ fn source_ledger_matches(observation: &str, source: &DiscoveredSourceFile) -> bo
     let Some(files) = saved["dependencies"].as_array() else {
         return false;
     };
+    // Entries recorded before the folder rule still list the folder; ignore it
+    // for self-contained connectors so they are reused too.
+    let ignored_folder = (!source_folder_is_dependency(&source.provider_slug))
+        .then(|| source.source_path.parent())
+        .flatten();
     files.iter().all(|file| {
-        file["path"]
-            .as_str()
-            .is_some_and(|path| source_file_observation(Path::new(path)).as_ref() == Some(file))
+        file["path"].as_str().is_some_and(|path| {
+            Some(Path::new(path)) == ignored_folder
+                || source_file_observation(Path::new(path)).as_ref() == Some(file)
+        })
     })
+}
+
+/// Whether a source's folder is a reuse dependency for this connector.
+///
+/// The folder stands in for sidecars: a connector that reads optional files
+/// next to its source (a SQLite WAL, a metadata file) must re-parse when one
+/// appears, and a new file changes the folder. The Claude Code and Codex
+/// connectors read each source on its own and never name sidecars, so a new
+/// sibling (such as another subagent transcript) says nothing about an
+/// existing source. Treating the folder as a dependency for them re-parsed
+/// every unchanged file in a folder each time a file was added to it.
+fn source_folder_is_dependency(provider_slug: &str) -> bool {
+    !matches!(provider_slug, "claude_code" | "codex")
 }
 
 /// Keep only the final bounded batch until the connector certifies a source.
@@ -14194,15 +14213,18 @@ fn scan_with_durable_source_boundaries(
         if Some(&primary) != primary_before.borrow().as_ref() {
             return sender.borrow_mut().flush();
         }
-        let parent = completion
-            .source
-            .source_path
-            .parent()
-            .and_then(source_file_observation);
-        if parent.is_none() || parent != *before.borrow() {
-            return sender.borrow_mut().flush();
+        let mut dependencies = Vec::new();
+        if source_folder_is_dependency(&completion.source.provider_slug) {
+            let parent = completion
+                .source
+                .source_path
+                .parent()
+                .and_then(source_file_observation);
+            if parent.is_none() || parent != *before.borrow() {
+                return sender.borrow_mut().flush();
+            }
+            dependencies.push(parent.expect("checked parent"));
         }
-        let mut dependencies = vec![parent.expect("checked parent")];
         for sidecar in &completion.required_sidecars {
             let Some(observation) = source_file_observation(&sidecar.source_path) else {
                 return sender.borrow_mut().flush();
@@ -53186,6 +53208,49 @@ mod tests {
         std::fs::write(temp.path().join("new-required-sidecar"), b"new").unwrap();
         assert!(!source_ledger_matches(&saved, &source));
         assert!(!source_ledger_matches("{}", &source));
+    }
+
+    #[test]
+    fn source_ledger_ignores_new_sibling_only_for_connectors_without_sidecars() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("agent-a.jsonl");
+        std::fs::write(&path, b"source").unwrap();
+        let saved = serde_json::json!({"primary":source_file_observation(&path).unwrap(),
+            "producer_contract":env!("CASS_SOURCE_INGEST_CONTRACT"),
+            "dependencies":[source_file_observation(temp.path()).unwrap()]})
+        .to_string();
+        let source_for = |slug: &str| {
+            DiscoveredSourceFile::new(
+                slug,
+                &ScanRoot::local(temp.path().to_path_buf()),
+                path.clone(),
+                crate::connectors::DiscoveredSourceRole::PrimarySessionLog,
+                true,
+            )
+            .with_fs_metadata()
+        };
+        let folder_before = source_file_observation(temp.path()).unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        std::fs::write(temp.path().join("agent-b.jsonl"), b"new sibling").unwrap();
+        assert_ne!(
+            source_file_observation(temp.path()).unwrap(),
+            folder_before,
+            "a new file must change the folder observation"
+        );
+        for slug in ["claude_code", "codex"] {
+            assert!(
+                source_ledger_matches(&saved, &source_for(slug)),
+                "{slug} reads no sidecars; a new sibling must not force a re-parse"
+            );
+        }
+        for slug in ["kiro", "shelley", "grok"] {
+            assert!(
+                !source_ledger_matches(&saved, &source_for(slug)),
+                "{slug} may read sidecars; a changed folder must force a re-parse"
+            );
+        }
+        std::fs::write(&path, b"changed primary").unwrap();
+        assert!(!source_ledger_matches(&saved, &source_for("claude_code")));
     }
 
     #[test]
