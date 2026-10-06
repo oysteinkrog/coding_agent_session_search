@@ -458,9 +458,22 @@ fn emit_source_ingest_contract(manifest_dir: &Path) {
         hasher.update(value.as_bytes());
         hasher.update(b"\0");
     }
+    // LOCAL PIN, deliberate. Remove it when any parser changes.
+    //
+    // This branch (localbuilds recipe "cass") changes only the ingest ledger's
+    // reuse rule in src/indexer/mod.rs. No parser, normalizer or dependency
+    // changed since upstream 4773d03e, so ledger entries recorded by that
+    // build are still valid. The computed hash would differ only because the
+    // ledger code changed, and a new contract re-parses the whole corpus. So
+    // emit the 4773d03e build's contract instead.
+    //
+    // Remove this pin (emit `hasher.finalize()` again) as soon as this branch
+    // moves to a newer upstream commit or changes any parser, normalizer,
+    // Cargo.toml or Cargo.lock. Otherwise entries written by an older parser
+    // would be reused by a newer one.
+    let _computed_contract = hasher.finalize();
     println!(
-        "cargo:rustc-env=CASS_SOURCE_INGEST_CONTRACT={}",
-        hasher.finalize()
+        "cargo:rustc-env=CASS_SOURCE_INGEST_CONTRACT=c01f9a85a83afd5c7e53a6321caf693511f363f108feb41d861d0ced428cfd6b"
     );
 }
 
