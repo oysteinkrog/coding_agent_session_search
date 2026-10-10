@@ -13739,6 +13739,9 @@ fn source_ledger_key(source: &DiscoveredSourceFile, ctx: &ScanContext) -> String
     )
 }
 
+/// The device number is not recorded: btrfs gives each subvolume mount a new
+/// anonymous device number at boot, so it changes while the file does not.
+/// Size, mtime, inode and ctime still catch a real change.
 fn source_file_observation(path: &Path) -> Option<serde_json::Value> {
     match std::fs::metadata(path) {
         Ok(metadata) => {
@@ -13750,7 +13753,6 @@ fn source_file_observation(path: &Path) -> Option<serde_json::Value> {
             let observation = {
                 use std::os::unix::fs::MetadataExt;
                 let mut observation = observation;
-                observation["device"] = serde_json::json!(metadata.dev());
                 observation["inode"] = serde_json::json!(metadata.ino());
                 observation["ctime"] = serde_json::json!([metadata.ctime(), metadata.ctime_nsec()]);
                 observation
@@ -13764,6 +13766,16 @@ fn source_file_observation(path: &Path) -> Option<serde_json::Value> {
     }
 }
 
+/// Whether a saved observation matches the file now. Entries recorded before
+/// the device number was dropped still carry it; ignore it so they are reused.
+fn source_observation_matches(saved: &serde_json::Value, path: &Path) -> bool {
+    let mut saved = saved.clone();
+    if let Some(fields) = saved.as_object_mut() {
+        fields.remove("device");
+    }
+    source_file_observation(path).is_some_and(|current| current == saved)
+}
+
 fn source_ledger_matches(observation: &str, source: &DiscoveredSourceFile) -> bool {
     let Ok(saved) = serde_json::from_str::<serde_json::Value>(observation) else {
         return false;
@@ -13771,7 +13783,7 @@ fn source_ledger_matches(observation: &str, source: &DiscoveredSourceFile) -> bo
     if saved["producer_contract"].as_str() != Some(env!("CASS_SOURCE_INGEST_CONTRACT")) {
         return false;
     }
-    if saved["primary"] != source_file_observation(&source.source_path).unwrap_or_default() {
+    if !source_observation_matches(&saved["primary"], &source.source_path) {
         return false;
     }
     let Some(files) = saved["dependencies"].as_array() else {
@@ -13785,7 +13797,7 @@ fn source_ledger_matches(observation: &str, source: &DiscoveredSourceFile) -> bo
     files.iter().all(|file| {
         file["path"].as_str().is_some_and(|path| {
             Some(Path::new(path)) == ignored_folder
-                || source_file_observation(Path::new(path)).as_ref() == Some(file)
+                || source_observation_matches(file, Path::new(path))
         })
     })
 }
@@ -52628,6 +52640,36 @@ mod tests {
         }
         std::fs::write(&path, b"changed primary").unwrap();
         assert!(!source_ledger_matches(&saved, &source_for("claude_code")));
+    }
+
+    #[test]
+    fn source_ledger_ignores_device_number() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("agent-a.jsonl");
+        std::fs::write(&path, b"source").unwrap();
+        let source = DiscoveredSourceFile::new(
+            "claude_code",
+            &ScanRoot::local(temp.path().to_path_buf()),
+            path.clone(),
+            crate::connectors::DiscoveredSourceRole::PrimarySessionLog,
+            true,
+        )
+        .with_fs_metadata();
+        let saved_with_device = |device: u64| {
+            let mut primary = source_file_observation(&path).unwrap();
+            assert!(primary.get("device").is_none(), "device must not be recorded");
+            primary["device"] = serde_json::json!(device);
+            serde_json::json!({"primary":primary,
+                "producer_contract":env!("CASS_SOURCE_INGEST_CONTRACT"),
+                "dependencies":[]})
+            .to_string()
+        };
+        // An entry recorded before a reboot that renumbered the mount.
+        assert!(source_ledger_matches(&saved_with_device(36), &source));
+        assert!(source_ledger_matches(&saved_with_device(u64::MAX), &source));
+        let saved = saved_with_device(36);
+        std::fs::write(&path, b"changed primary").unwrap();
+        assert!(!source_ledger_matches(&saved, &source));
     }
 
     #[test]
