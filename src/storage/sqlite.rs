@@ -7925,6 +7925,33 @@ fn clear_semantic_embed_watermark_after_deletion(tx: &FrankenTransaction<'_>) ->
     Ok(())
 }
 
+/// Keep a Claude Code session's stored title equal to what a parse of the
+/// whole transcript gives now.
+///
+/// Claude names a session late, with an `ai-title` line. A session stored in
+/// parts, or grown by tail ingest, reaches the archive before that line, so
+/// the title is refreshed when a later part or tail carries a different one.
+/// Only the conversation row changes: lexical documents keep the title they
+/// were written with, as appended messages always have, so this never asks
+/// for a lexical rebuild.
+fn franken_reconcile_claude_title(
+    tx: &FrankenTransaction<'_>,
+    conversation_id: i64,
+    conv: &Conversation,
+) -> Result<()> {
+    if conv.agent_slug != "claude_code" {
+        return Ok(());
+    }
+    let Some(title) = conv.title.as_deref() else {
+        return Ok(());
+    };
+    tx.execute_compat(
+        "UPDATE conversations SET title = ?1 WHERE id = ?2 AND (title IS NULL OR title <> ?1)",
+        fparams![title, conversation_id],
+    )?;
+    Ok(())
+}
+
 fn franken_reconcile_cursor_workspace(
     tx: &FrankenTransaction<'_>,
     agent_id: i64,
@@ -7932,6 +7959,7 @@ fn franken_reconcile_cursor_workspace(
     workspace_id: Option<i64>,
     conv: &Conversation,
 ) -> Result<bool> {
+    franken_reconcile_claude_title(tx, conversation_id, conv)?;
     if shelley_metadata_is_authoritative(conv) {
         return franken_reconcile_shelley_metadata(
             tx,

@@ -13821,6 +13821,85 @@ fn source_folder_is_dependency(provider_slug: &str) -> bool {
     !matches!(provider_slug, "claude_code" | "codex")
 }
 
+/// Tail ingest: when a connector reports where it stopped in an append-only
+/// source, the ledger keeps that point and the next run parses only the bytes
+/// added since. `CASS_TAIL_INGEST=0` turns it off (every changed source is
+/// parsed from the start again).
+fn tail_ingest_enabled() -> bool {
+    dotenvy::var("CASS_TAIL_INGEST")
+        .map(|value| !(value.trim() == "0" || value.trim().eq_ignore_ascii_case("false")))
+        .unwrap_or(true)
+}
+
+/// The ledger's `tail` object for a source the connector stopped in at
+/// `tail.offset`. The prefix is stored as a length and a blake3 hash only.
+fn source_ledger_tail(
+    primary: &serde_json::Value,
+    tail: &franken_agent_detection::connectors::SourceTailState,
+) -> serde_json::Value {
+    serde_json::json!({
+        "offset": tail.offset,
+        "next_idx": tail.next_idx,
+        "carried": tail.carried,
+        "inode": primary.get("inode"),
+        "prefix_len": tail.prefix.len(),
+        "prefix_blake3": blake3::hash(&tail.prefix).to_hex().to_string(),
+    })
+}
+
+/// A resume point from a saved ledger entry, when the file looks like the
+/// same file with bytes only appended: same producer contract, same inode, at
+/// least `offset` bytes long, and the bytes just before `offset` still hash
+/// the same. Anything else returns `None`, and the source is parsed from the
+/// start (a truncated, replaced or rewritten file).
+fn source_ledger_tail_resume(
+    observation: &str,
+    path: &Path,
+) -> Option<franken_agent_detection::connectors::SourceTailResume> {
+    use std::io::Read;
+    const PREFIX: u64 = franken_agent_detection::connectors::SOURCE_TAIL_PREFIX_BYTES as u64;
+    let saved = serde_json::from_str::<serde_json::Value>(observation).ok()?;
+    if saved["producer_contract"].as_str() != Some(env!("CASS_SOURCE_INGEST_CONTRACT")) {
+        return None;
+    }
+    let tail = saved.get("tail")?;
+    let offset = tail["offset"].as_u64()?;
+    let next_idx = tail["next_idx"].as_i64()?;
+    let prefix_len = tail["prefix_len"].as_u64()?;
+    let expected = tail["prefix_blake3"].as_str()?;
+    if offset == 0 || next_idx < 0 || prefix_len != offset.min(PREFIX) {
+        return None;
+    }
+    let metadata = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if tail["inode"].as_u64() != Some(metadata.ino()) {
+            return None;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // No inode to tell a replaced file from a grown one.
+        return None;
+    }
+    if metadata.len() < offset {
+        return None;
+    }
+    let mut file = File::open(path).ok()?;
+    file.seek(std::io::SeekFrom::Start(offset - prefix_len)).ok()?;
+    let mut prefix = vec![0u8; usize::try_from(prefix_len).ok()?];
+    file.read_exact(&mut prefix).ok()?;
+    if blake3::hash(&prefix).to_hex().as_str() != expected {
+        return None;
+    }
+    Some(franken_agent_detection::connectors::SourceTailResume {
+        offset,
+        next_idx,
+        carried: tail["carried"].clone(),
+    })
+}
+
 /// Keep only the final bounded batch until the connector certifies a source.
 /// Filtering or a changing reconstruction dependency withholds the marker.
 fn scan_with_durable_source_boundaries(
@@ -13881,7 +13960,53 @@ fn scan_with_durable_source_boundaries(
         tracing::debug!(connector=%source.provider_slug, skipped=skip,"source_ingest_observation");
         !skip
     };
+    let tail_ingest = tail_ingest_enabled() && env!("CASS_SOURCE_INGEST_REUSE") == "true";
+    let mut tail_resume = |source: &DiscoveredSourceFile| {
+        if filtered.get() {
+            return None;
+        }
+        let resume = config
+            .source_ledger
+            .get(&source_ledger_key(source, &ctx))
+            .and_then(|saved| source_ledger_tail_resume(saved, &source.source_path));
+        tracing::debug!(
+            connector = %source.provider_slug,
+            resumed = resume.is_some(),
+            offset = resume.as_ref().map(|resume| resume.offset),
+            "source_ingest_tail_resume"
+        );
+        resume
+    };
     let mut complete = |completion: &franken_agent_detection::connectors::SourceCompletion| {
+        if let Some(tail) = completion.tail.as_ref()
+            && !source_folder_is_dependency(&completion.source.provider_slug)
+            && completion.required_sidecars.is_empty()
+        {
+            // The connector read only the bytes that existed before the parse
+            // and stopped after the last complete line, so the source may have
+            // grown since. Record the pre-parse observation with its size set
+            // to the consumed offset: an unchanged, fully consumed file still
+            // matches, and anything appended makes the next run resume at
+            // `offset` instead of parsing the file again.
+            if filtered.get() || completion.conversations_emitted == 0 {
+                return sender.borrow_mut().flush();
+            }
+            let Some(mut primary) = primary_before.borrow().clone() else {
+                return sender.borrow_mut().flush();
+            };
+            if primary.get("absent").is_some() || primary.get("size").is_none() {
+                return sender.borrow_mut().flush();
+            }
+            primary["size"] = serde_json::json!(tail.offset);
+            let entry = crate::storage::sqlite::SourceIngestLedgerEntry {
+                key: source_ledger_key(&completion.source, &ctx),
+                observation: serde_json::json!({"primary":primary,"dependencies":[],
+                    "producer_contract":env!("CASS_SOURCE_INGEST_CONTRACT"),
+                    "tail":source_ledger_tail(&primary, tail)})
+                .to_string(),
+            };
+            return sender.borrow_mut().complete_source(entry);
+        }
         if filtered.get()
             || completion.conversations_emitted == 0
             || completion.source.fs_metadata_changed()
@@ -13930,6 +14055,11 @@ fn scan_with_durable_source_boundaries(
     let mut hooks = franken_agent_detection::connectors::SourceScanHooks {
         should_scan_source: Some(&mut should_scan),
         on_source_complete: Some(&mut complete),
+        tail_resume: if tail_ingest {
+            Some(&mut tail_resume)
+        } else {
+            None
+        },
     };
     connector.scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {
         if config
