@@ -427,7 +427,7 @@ path = "tests/recovery/mod.rs"
 # Claude Code emission and tail scans. A `git` source, never `path`: build.rs
 # turns source ingest ledger reuse off when any locked package has no source.
 [patch.crates-io]
-franken-agent-detection = { git = "file:///var/tmp/claude/cass-stream/fad", rev = "36f537e11e1911f7f05f6eca7db15a230fd93e88" }
+franken-agent-detection = { git = "file:///var/tmp/claude/cass-stream/fad", rev = "03d204a5cd527c195457aa448a4363369d454f9b" }
 # LOCAL: fsqlite-core 0.4.6 with the clean-root probe starting past the end of
 # the database (a `sqlite_master` query read the whole 29 GB file into memory).
 fsqlite-core = { git = "file:///var/tmp/claude/cass-stream/fsqlite", rev = "959e4942883fbe70fa4bae56a7d45a1be2b43a31" }

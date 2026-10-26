@@ -2054,7 +2054,7 @@ dependencies = [
 [[package]]
 name = "franken-agent-detection"
 version = "0.3.3"
-source = "git+file:///var/tmp/claude/cass-stream/fad?rev=36f537e11e1911f7f05f6eca7db15a230fd93e88#36f537e11e1911f7f05f6eca7db15a230fd93e88"
+source = "git+file:///var/tmp/claude/cass-stream/fad?rev=03d204a5cd527c195457aa448a4363369d454f9b#03d204a5cd527c195457aa448a4363369d454f9b"
 dependencies = [
  "aes-gcm",
  "anyhow",

@@ -250,3 +250,30 @@ fn a_rewritten_session_falls_back_to_a_full_parse() {
     write_lines(&f.session, &all[..10]);
     index(&f.home, &data, None, false);
 }
+
+#[test]
+fn a_rewrite_near_the_start_is_not_resumed() {
+    // Same inode, same length, same bytes just before the saved offset, but
+    // line 1 changed: the head check sends the file to a full parse, and the
+    // archive keeps one row per message.
+    let all = session_lines(30, None);
+    let f = fixture(&all[..20]);
+    let data = f.home.parent().unwrap().join("data-head");
+    index(&f.home, &data, None, false);
+
+    let mut rewritten = all.clone();
+    rewritten[1] = rewritten[1].replace("chunkprobe", "chunkPROBE");
+    assert_eq!(rewritten[1].len(), all[1].len());
+    write_lines(&f.session, &rewritten);
+    index(&f.home, &data, None, false);
+
+    let fresh = f.home.parent().unwrap().join("data-head-fresh");
+    index(&f.home, &fresh, None, true);
+    let (_, messages) = archive(&data);
+    let (_, fresh_messages) = archive(&fresh);
+    assert_eq!(messages.len(), fresh_messages.len(), "no duplicates, nothing missing");
+    let idx: Vec<_> = messages.iter().map(|m| m[0].clone()).collect();
+    let fresh_idx: Vec<_> = fresh_messages.iter().map(|m| m[0].clone()).collect();
+    assert_eq!(idx, fresh_idx);
+}
+

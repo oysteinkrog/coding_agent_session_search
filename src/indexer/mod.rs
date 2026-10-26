@@ -13783,22 +13783,26 @@ fn source_observation_matches(saved: &serde_json::Value, path: &Path) -> bool {
 }
 
 /// Whether a ledger entry's producer contract is this build's, or an earlier
-/// one listed as accepted in `source-ingest-contract.pin` (local patch).
-fn source_ingest_contract_accepted(contract: Option<&str>) -> bool {
+/// one listed as accepted in `source-ingest-contract.pin` (local patch). The
+/// earlier contracts were checked for Claude Code sources only, so they are
+/// accepted only for that provider.
+fn source_ingest_contract_accepted(contract: Option<&str>, provider_slug: &str) -> bool {
     let Some(contract) = contract else {
         return false;
     };
     contract == env!("CASS_SOURCE_INGEST_CONTRACT")
-        || env!("CASS_SOURCE_INGEST_CONTRACT_ACCEPTED")
-            .split(',')
-            .any(|accepted| !accepted.is_empty() && accepted == contract)
+        || (provider_slug == "claude_code"
+            && env!("CASS_SOURCE_INGEST_CONTRACT_ACCEPTED")
+                .split(',')
+                .any(|accepted| !accepted.is_empty() && accepted == contract))
 }
 
 fn source_ledger_matches(observation: &str, source: &DiscoveredSourceFile) -> bool {
     let Ok(saved) = serde_json::from_str::<serde_json::Value>(observation) else {
         return false;
     };
-    if !source_ingest_contract_accepted(saved["producer_contract"].as_str()) {
+    if !source_ingest_contract_accepted(saved["producer_contract"].as_str(), &source.provider_slug)
+    {
         return false;
     }
     if !source_observation_matches(&saved["primary"], &source.source_path) {
@@ -13854,16 +13858,22 @@ fn source_ledger_tail(
         "next_idx": tail.next_idx,
         "carried": tail.carried,
         "inode": primary.get("inode"),
+        "file_dev": tail.dev,
+        "file_inode": tail.inode,
+        "head_len": tail.head_len,
+        "head_blake3": tail.head_blake3,
         "prefix_len": tail.prefix.len(),
         "prefix_blake3": blake3::hash(&tail.prefix).to_hex().to_string(),
     })
 }
 
 /// A resume point from a saved ledger entry, when the file looks like the
-/// same file with bytes only appended: same producer contract, same inode, at
-/// least `offset` bytes long, and the bytes just before `offset` still hash
-/// the same. Anything else returns `None`, and the source is parsed from the
-/// start (a truncated, replaced or rewritten file).
+/// same file with bytes only appended: the current producer contract, the same
+/// device and inode, at least `offset` bytes, an mtime no older than the saved
+/// one, and the bytes just before `offset` still hash the same. Anything else
+/// returns `None`, and the source is parsed from the start (a truncated,
+/// replaced or rewritten file). The connector checks the device, inode, first
+/// 64 KiB and the bytes before `offset` again on the file it opens.
 fn source_ledger_tail_resume(
     observation: &str,
     path: &Path,
@@ -13871,7 +13881,7 @@ fn source_ledger_tail_resume(
     use std::io::Read;
     const PREFIX: u64 = franken_agent_detection::connectors::SOURCE_TAIL_PREFIX_BYTES as u64;
     let saved = serde_json::from_str::<serde_json::Value>(observation).ok()?;
-    if !source_ingest_contract_accepted(saved["producer_contract"].as_str()) {
+    if saved["producer_contract"].as_str() != Some(env!("CASS_SOURCE_INGEST_CONTRACT")) {
         return None;
     }
     let tail = saved.get("tail")?;
@@ -13879,6 +13889,10 @@ fn source_ledger_tail_resume(
     let next_idx = tail["next_idx"].as_i64()?;
     let prefix_len = tail["prefix_len"].as_u64()?;
     let expected = tail["prefix_blake3"].as_str()?;
+    let dev = tail["file_dev"].as_u64()?;
+    let inode = tail["file_inode"].as_u64()?;
+    let head_len = tail["head_len"].as_u64()?;
+    let head_blake3 = tail["head_blake3"].as_str()?;
     if offset == 0 || next_idx < 0 || prefix_len != offset.min(PREFIX) {
         return None;
     }
@@ -13886,13 +13900,22 @@ fn source_ledger_tail_resume(
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if tail["inode"].as_u64() != Some(metadata.ino()) {
+        if (metadata.dev(), metadata.ino()) != (dev, inode) {
+            return None;
+        }
+        let saved_mtime = saved["primary"]["mtime_ns"]
+            .as_str()
+            .and_then(|value| value.parse::<i128>().ok())?;
+        let mtime =
+            i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec());
+        if mtime < saved_mtime {
             return None;
         }
     }
     #[cfg(not(unix))]
     {
         // No inode to tell a replaced file from a grown one.
+        let _ = (dev, inode);
         return None;
     }
     if metadata.len() < offset {
@@ -13909,6 +13932,11 @@ fn source_ledger_tail_resume(
         offset,
         next_idx,
         carried: tail["carried"].clone(),
+        dev,
+        inode,
+        head_len,
+        head_blake3: head_blake3.to_string(),
+        prefix_blake3: expected.to_string(),
     })
 }
 
@@ -14007,6 +14035,11 @@ fn scan_with_durable_source_boundaries(
                 return sender.borrow_mut().flush();
             };
             if primary.get("absent").is_some() || primary.get("size").is_none() {
+                return sender.borrow_mut().flush();
+            }
+            // The file the connector read must be the one observed before
+            // the parse; otherwise keep no tail and let the next run re-parse.
+            if primary["inode"].as_u64() != Some(tail.inode) {
                 return sender.borrow_mut().flush();
             }
             primary["size"] = serde_json::json!(tail.offset);
@@ -52981,6 +53014,18 @@ mod tests {
             carried: serde_json::json!({"v": 1}),
             prefix: bytes[from..consumed as usize].to_vec(),
             resumed: false,
+            dev: {
+                use std::os::unix::fs::MetadataExt;
+                std::fs::metadata(path).unwrap().dev()
+            },
+            inode: {
+                use std::os::unix::fs::MetadataExt;
+                std::fs::metadata(path).unwrap().ino()
+            },
+            head_len: consumed.min(64 * 1024),
+            head_blake3: blake3::hash(&bytes[..consumed.min(64 * 1024) as usize])
+                .to_hex()
+                .to_string(),
         };
         let mut primary = source_file_observation(path).unwrap();
         primary["size"] = serde_json::json!(consumed);
@@ -53053,8 +53098,14 @@ mod tests {
         assert!(source_ledger_matches(&entry(env!("CASS_SOURCE_INGEST_CONTRACT")), &source));
         assert!(source_ledger_matches(&entry(earlier), &source));
         assert!(!source_ledger_matches(&entry(&"0".repeat(64)), &source));
-        assert!(!source_ingest_contract_accepted(Some("")));
-        assert!(!source_ingest_contract_accepted(None));
+        assert!(!source_ingest_contract_accepted(Some(""), "claude_code"));
+        assert!(!source_ingest_contract_accepted(None, "claude_code"));
+        // The earlier contract was checked for Claude Code sources only.
+        assert!(!source_ingest_contract_accepted(Some(earlier), "codex"));
+        assert!(source_ingest_contract_accepted(
+            Some(env!("CASS_SOURCE_INGEST_CONTRACT")),
+            "codex"
+        ));
     }
 
     #[test]
