@@ -53031,6 +53031,33 @@ mod tests {
     }
 
     #[test]
+    fn source_ledger_accepts_the_contracts_listed_in_the_pin_file() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("session.jsonl");
+        std::fs::write(&path, jsonl_bytes(0..5)).unwrap();
+        let source = DiscoveredSourceFile::new(
+            "claude_code",
+            &ScanRoot::local(temp.path().to_path_buf()),
+            path.clone(),
+            crate::connectors::DiscoveredSourceRole::PrimarySessionLog,
+            true,
+        )
+        .with_fs_metadata();
+        let entry = |contract: &str| {
+            serde_json::json!({"primary":source_file_observation(&path).unwrap(),
+                "dependencies":[],"producer_contract":contract})
+            .to_string()
+        };
+        // source-ingest-contract.pin accepts the 4773d03e build's contract.
+        let earlier = "c01f9a85a83afd5c7e53a6321caf693511f363f108feb41d861d0ced428cfd6b";
+        assert!(source_ledger_matches(&entry(env!("CASS_SOURCE_INGEST_CONTRACT")), &source));
+        assert!(source_ledger_matches(&entry(earlier), &source));
+        assert!(!source_ledger_matches(&entry(&"0".repeat(64)), &source));
+        assert!(!source_ingest_contract_accepted(Some("")));
+        assert!(!source_ingest_contract_accepted(None));
+    }
+
+    #[test]
     fn source_ledger_tail_falls_back_when_the_file_is_not_an_append() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("session.jsonl");
