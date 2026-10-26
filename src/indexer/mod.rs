@@ -13710,6 +13710,12 @@ struct StreamingBatchSender<'a> {
     byte_reservation: usize,
 }
 
+/// Whether two emitted conversations are parts of one session (same agent,
+/// identity and source file).
+fn same_session_part(a: &NormalizedConversation, b: &NormalizedConversation) -> bool {
+    a.agent_slug == b.agent_slug && a.external_id == b.external_id && a.source_path == b.source_path
+}
+
 fn remember_discovered_connector(discovered_names: &mut Vec<String>, connector_name: &'static str) {
     if !discovered_names.iter().any(|name| name == connector_name) {
         discovered_names.push(connector_name.to_string());
@@ -13970,7 +13976,15 @@ impl<'a> StreamingBatchSender<'a> {
 
     fn push(&mut self, conversation: NormalizedConversation) -> Result<()> {
         let footprint = conversation_batch_footprint(&conversation);
-        let would_exceed_limits = !self.conversations.is_empty()
+        // A connector may emit one large session in several parts. Each part
+        // goes in its own batch, so a batch never holds two rows for one
+        // conversation and every part is stored and freed before the next.
+        let same_session_part = self
+            .conversations
+            .last()
+            .is_some_and(|last| same_session_part(last, &conversation));
+        let would_exceed_limits = same_session_part
+            || !self.conversations.is_empty()
             && (self.conversations.len() >= DEFAULT_STREAMING_BATCH_LIMITS.max_conversations
                 || self.message_count.saturating_add(footprint.message_count)
                     > DEFAULT_STREAMING_BATCH_LIMITS.max_messages
@@ -14296,6 +14310,7 @@ fn spawn_connector_producer(
                     config.active_source_filter.as_ref(),
                 );
             active_source_skipped |= preparse_active_source_skipped;
+            let mut capture_cache = RawMirrorCaptureCache::default();
             match scan_with_durable_source_boundaries(
                 conn.as_ref(),
                 &ctx,
@@ -14314,12 +14329,13 @@ fn spawn_connector_producer(
                         return Ok(None);
                     }
                     ingest_diagnostics.observe_conversation(&mut conversation);
-                    prepare_conversation_for_ingest(
+                    prepare_conversation_for_ingest_with_capture_cache(
                         &config.data_dir,
                         name,
                         &local_origin,
                         None,
                         &mut conversation,
+                        &mut capture_cache,
                     );
                     // #332: each parsed conversation is live work even while the
                     // batch sender buffers it below publication thresholds — this
@@ -14408,6 +14424,7 @@ fn spawn_connector_producer(
                     config.active_source_filter.as_ref(),
                 );
             active_source_skipped |= preparse_active_source_skipped;
+            let mut capture_cache = RawMirrorCaptureCache::default();
             match scan_with_durable_source_boundaries(
                 conn.as_ref(),
                 &ctx,
@@ -14426,12 +14443,13 @@ fn spawn_connector_producer(
                         return Ok(None);
                     }
                     ingest_diagnostics.observe_conversation(&mut conversation);
-                    prepare_conversation_for_ingest(
+                    prepare_conversation_for_ingest_with_capture_cache(
                         &config.data_dir,
                         name,
                         &root.origin,
                         Some(root),
                         &mut conversation,
+                        &mut capture_cache,
                     );
 
                     if !was_detected && !is_discovered {
@@ -14869,6 +14887,10 @@ fn run_streaming_consumer(
                                 is_discovered: extra_discovered,
                                 message_count: extra_msg_count,
                                 byte_reservation: extra_byte_reservation,
+                            }) if !extra_convs.iter().any(|extra| {
+                                combined_conversations
+                                    .iter()
+                                    .any(|combined| same_session_part(combined, extra))
                             }) => {
                                 let extra_size = extra_convs.len();
                                 // Per-connector stats for the extra batch.
@@ -32183,13 +32205,86 @@ fn prepare_conversation_for_ingest(
     workspace_rewrite_root: Option<&ScanRoot>,
     conv: &mut NormalizedConversation,
 ) {
+    prepare_conversation_for_ingest_with_capture_cache(
+        data_dir,
+        connector_name,
+        origin,
+        workspace_rewrite_root,
+        conv,
+        &mut RawMirrorCaptureCache::default(),
+    );
+}
+
+/// The raw-mirror capture of the last Claude Code session a producer saw.
+///
+/// A large session arrives as several parts from one source file, and each
+/// capture reads and hashes the whole file. Later parts of the same session
+/// reuse the first part's capture record instead.
+#[derive(Default)]
+struct RawMirrorCaptureCache {
+    last: Option<(String, Option<String>, PathBuf, Option<serde_json::Value>)>,
+}
+
+impl RawMirrorCaptureCache {
+    fn attach(&mut self, data_dir: &Path, conv: &mut NormalizedConversation) {
+        if conv.agent_slug != "claude_code" {
+            attach_raw_mirror_capture(data_dir, conv);
+            return;
+        }
+        if let Some((agent, external_id, source_path, raw_mirror)) = &self.last
+            && *agent == conv.agent_slug
+            && *external_id == conv.external_id
+            && *source_path == conv.source_path
+        {
+            if let Some(raw_mirror) = raw_mirror {
+                set_raw_mirror_metadata(conv, raw_mirror.clone());
+            }
+            return;
+        }
+        attach_raw_mirror_capture(data_dir, conv);
+        let raw_mirror = conv.metadata.pointer("/cass/raw_mirror").cloned();
+        self.last = Some((
+            conv.agent_slug.clone(),
+            conv.external_id.clone(),
+            conv.source_path.clone(),
+            raw_mirror,
+        ));
+    }
+}
+
+fn set_raw_mirror_metadata(conv: &mut NormalizedConversation, raw_mirror: serde_json::Value) {
+    if !conv.metadata.is_object() {
+        conv.metadata = serde_json::json!({});
+    }
+    let Some(metadata) = conv.metadata.as_object_mut() else {
+        return;
+    };
+    let cass = metadata
+        .entry("cass".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !cass.is_object() {
+        *cass = serde_json::json!({});
+    }
+    if let Some(cass) = cass.as_object_mut() {
+        cass.insert("raw_mirror".to_string(), raw_mirror);
+    }
+}
+
+fn prepare_conversation_for_ingest_with_capture_cache(
+    data_dir: &Path,
+    connector_name: &str,
+    origin: &Origin,
+    workspace_rewrite_root: Option<&ScanRoot>,
+    conv: &mut NormalizedConversation,
+    capture_cache: &mut RawMirrorCaptureCache,
+) {
     inject_provenance(conv, origin);
     canonicalize_claude_external_id(connector_name, conv);
     if let Some(root) = workspace_rewrite_root {
         apply_workspace_rewrite(conv, root);
     }
     compact_large_connector_extras(connector_name, conv);
-    attach_raw_mirror_capture(data_dir, conv);
+    capture_cache.attach(data_dir, conv);
 }
 
 fn capture_connector_sources_before_parse(
