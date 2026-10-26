@@ -38,6 +38,12 @@ fn session_lines(count: usize, title_after: Option<usize>) -> Vec<String> {
         if Some(i) == title_after {
             lines.push(r#"{"type":"ai-title","title":"Chunk probe session"}"#.to_string());
         }
+        // Claude replays earlier lines (resume, compaction) with their old
+        // timestamps; a one-shot insert keeps them.
+        if i == 30 || i == 44 {
+            lines.push(line(i - 20));
+            lines.push(line(i - 19));
+        }
     }
     lines
 }
@@ -179,7 +185,7 @@ fn a_session_stored_in_parts_searches_and_displays_like_one_stored_whole() {
     let (conv_parts, msgs_parts) = archive(&parts);
     assert_eq!(conv_whole.len(), 1, "one conversation: {conv_whole:?}");
     assert_eq!(conv_parts, conv_whole, "one row with the same title, times and workspace");
-    assert_eq!(msgs_whole.len(), 60);
+    assert_eq!(msgs_whole.len(), 64, "60 messages and 4 replayed lines");
     assert_eq!(msgs_parts, msgs_whole, "same messages and idx");
     assert_eq!(conv_parts[0][1], "Chunk probe session");
 
