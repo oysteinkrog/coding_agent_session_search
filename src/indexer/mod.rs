@@ -14052,14 +14052,20 @@ fn scan_with_durable_source_boundaries(
         };
         sender.borrow_mut().complete_source(entry)
     };
+    #[allow(clippy::type_complexity)]
+    let tail_resume_hook: Option<
+        &mut dyn FnMut(
+            &DiscoveredSourceFile,
+        ) -> Option<franken_agent_detection::connectors::SourceTailResume>,
+    > = if tail_ingest {
+        Some(&mut tail_resume)
+    } else {
+        None
+    };
     let mut hooks = franken_agent_detection::connectors::SourceScanHooks {
         should_scan_source: Some(&mut should_scan),
         on_source_complete: Some(&mut complete),
-        tail_resume: if tail_ingest {
-            Some(&mut tail_resume)
-        } else {
-            None
-        },
+        tail_resume: tail_resume_hook,
     };
     connector.scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {
         if config
