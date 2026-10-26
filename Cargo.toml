@@ -427,4 +427,4 @@ path = "tests/recovery/mod.rs"
 # Claude Code emission and tail scans. A `git` source, never `path`: build.rs
 # turns source ingest ledger reuse off when any locked package has no source.
 [patch.crates-io]
-franken-agent-detection = { git = "file:///var/tmp/claude/cass-stream/fad", rev = "1ef3519a4b899516cffc4ee4590805cd7d768d84" }
+franken-agent-detection = { git = "file:///var/tmp/claude/cass-stream/fad", rev = "36f537e11e1911f7f05f6eca7db15a230fd93e88" }

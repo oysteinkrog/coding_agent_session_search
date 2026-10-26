@@ -39,7 +39,8 @@ fn session_lines(count: usize, title_after: Option<usize>) -> Vec<String> {
             lines.push(r#"{"type":"ai-title","title":"Chunk probe session"}"#.to_string());
         }
         // Claude replays earlier lines (resume, compaction) with their old
-        // timestamps; a one-shot insert keeps them.
+        // timestamps. A one-shot insert drops them as replay duplicates, so a
+        // later part that carries one must drop it too.
         if i == 30 || i == 44 {
             lines.push(line(i - 20));
             lines.push(line(i - 19));
@@ -185,7 +186,7 @@ fn a_session_stored_in_parts_searches_and_displays_like_one_stored_whole() {
     let (conv_parts, msgs_parts) = archive(&parts);
     assert_eq!(conv_whole.len(), 1, "one conversation: {conv_whole:?}");
     assert_eq!(conv_parts, conv_whole, "one row with the same title, times and workspace");
-    assert_eq!(msgs_whole.len(), 64, "60 messages and 4 replayed lines");
+    assert_eq!(msgs_whole.len(), 60, "4 replayed lines dropped");
     assert_eq!(msgs_parts, msgs_whole, "same messages and idx");
     assert_eq!(conv_parts[0][1], "Chunk probe session");
 
@@ -206,9 +207,11 @@ fn a_grown_session_is_ingested_from_its_tail_and_matches_a_fresh_full_index() {
     let f = fixture(&all[..40]);
     let tail = f.home.parent().unwrap().join("data-tail");
     index(&f.home, &tail, Some(7), false);
-    assert_eq!(archive(&tail).1.len(), 40);
+    // 38 messages; the 2 replayed lines are dropped.
+    assert_eq!(archive(&tail).1.len(), 38);
 
-    // Append 21 lines (20 messages and the ai-title) and index again.
+    // Append the rest (22 messages, 2 replayed lines and the ai-title) and
+    // index again.
     write_lines(&f.session, &all);
     index(&f.home, &tail, Some(7), false);
 

@@ -9429,44 +9429,6 @@ fn franken_set_conversation_tail_state_after_append(
     Ok(())
 }
 
-/// A part that the connector marked as continuing a session it emitted
-/// before (`metadata.continuesFromIdx`, set by the Claude Code connector on
-/// later parts of a split session and on tail scans), when the archive holds
-/// that session exactly up to the index before the part.
-///
-/// Such a part is stored as a plain append of all its messages, which is what
-/// a one-shot insert of the whole session does. The ordinary tail rule also
-/// requires newer timestamps and no repeated message, and Claude transcripts
-/// replay older lines, so without this every part fell through to the full
-/// merge: a lookup over all stored messages per part, which grew with every
-/// part and dropped replayed lines a one-shot insert keeps.
-fn collect_continuation_part_messages(
-    conv: &Conversation,
-    existing_max_idx: i64,
-) -> Option<ExistingConversationNewMessages<'_>> {
-    let first_idx = conv.metadata_json.get("continuesFromIdx")?.as_i64()?;
-    if conv.agent_slug != "claude_code" || first_idx != existing_max_idx.checked_add(1)? {
-        return None;
-    }
-    let mut expected = first_idx;
-    let mut new_chars = 0i64;
-    let mut messages = Vec::with_capacity(conv.messages.len());
-    for msg in &conv.messages {
-        if msg.idx != expected {
-            return None;
-        }
-        expected = expected.checked_add(1)?;
-        new_chars += msg.content.len() as i64;
-        messages.push(msg);
-    }
-    Some(ExistingConversationNewMessages {
-        messages,
-        new_chars,
-        idx_collision_count: 0,
-        first_collision_idx: None,
-    })
-}
-
 fn collect_append_only_tail_messages<'a>(
     conv: &'a Conversation,
     existing_max_idx: i64,
@@ -9482,10 +9444,6 @@ fn collect_append_only_tail_messages<'a>(
             idx_collision_count: 0,
             first_collision_idx: None,
         });
-    }
-
-    if let Some(plan) = collect_continuation_part_messages(conv, existing_max_idx) {
-        return Some(plan);
     }
 
     let mut split_idx = None;
