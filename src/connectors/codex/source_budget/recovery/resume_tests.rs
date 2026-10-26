@@ -39,6 +39,7 @@ fn completed_sources_are_reused_while_the_failed_source_retries() -> Result<()> 
         let mut hooks = SourceScanHooks {
             should_scan_source: Some(&mut predicate),
             on_source_complete: Some(&mut complete),
+            tail_resume: None,
         };
         let mut delivered = Vec::new();
         let result = connector.scan_with_source_boundaries(&ctx, &mut hooks, &mut |item| {

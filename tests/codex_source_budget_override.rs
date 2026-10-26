@@ -172,6 +172,7 @@ mod budget_override {
             let mut hooks = SourceScanHooks {
                 should_scan_source: None,
                 on_source_complete: Some(&mut complete),
+                tail_resume: None,
             };
             let mut delivered = Vec::new();
             let result =
@@ -282,6 +283,7 @@ mod budget_override {
             let mut hooks = SourceScanHooks {
                 should_scan_source: Some(&mut predicate),
                 on_source_complete: Some(&mut complete),
+                tail_resume: None,
             };
             let error = CodexConnector::new()
                 .scan_with_source_boundaries(&ctx, &mut hooks, &mut |_| {

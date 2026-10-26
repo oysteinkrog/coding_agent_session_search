@@ -36,6 +36,7 @@ fn late_size_rejection_continues_without_forwarding_completion() -> Result<()> {
     let mut hooks = SourceScanHooks {
         should_scan_source: None,
         on_source_complete: Some(&mut complete),
+        tail_resume: None,
     };
     let mut delivered = Vec::new();
     let error = scan(
@@ -117,6 +118,7 @@ fn generic_enrichment_failures_still_abort_at_the_failed_source() -> Result<()> 
         let mut hooks = SourceScanHooks {
             should_scan_source: None,
             on_source_complete: Some(&mut complete),
+            tail_resume: None,
         };
         let error = scan(
             &franken_agent_detection::CodexConnector::new(),
@@ -153,6 +155,7 @@ fn sink_errors_even_of_the_budget_type_must_abort() -> Result<()> {
     let mut hooks = SourceScanHooks {
         should_scan_source: None,
         on_source_complete: Some(&mut complete),
+        tail_resume: None,
     };
     let error = scan(
         &franken_agent_detection::CodexConnector::new(),
@@ -182,6 +185,7 @@ fn completion_sink_failure_is_not_hidden() -> Result<()> {
     let mut hooks = SourceScanHooks {
         should_scan_source: None,
         on_source_complete: Some(&mut complete),
+        tail_resume: None,
     };
     let error = scan(
         &franken_agent_detection::CodexConnector::new(),

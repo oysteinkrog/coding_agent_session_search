@@ -73,6 +73,7 @@ fn zero_message_failures_do_not_report_success_or_starve_healthy_sources() -> Re
             let mut hooks = SourceScanHooks {
                 should_scan_source: None,
                 on_source_complete: Some(&mut complete),
+                tail_resume: None,
             };
             let connector = CodexConnector::new();
             let error = connector
@@ -132,6 +133,7 @@ fn host_veto_prevents_validation_of_intentionally_skipped_input() -> Result<()> 
         let mut hooks = SourceScanHooks {
             should_scan_source: Some(&mut predicate),
             on_source_complete: None,
+            tail_resume: None,
         };
         let mut delivered = Vec::new();
         CodexConnector::new().scan_with_source_boundaries(

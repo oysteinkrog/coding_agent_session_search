@@ -144,6 +144,7 @@ fn assert_boundaries(connector: &CodexConnector, ctx: &ScanContext, expected: &[
         let mut hooks = SourceScanHooks {
             should_scan_source: Some(&mut should_scan),
             on_source_complete: Some(&mut complete),
+            tail_resume: None,
         };
         connector
             .scan_with_source_boundaries(ctx, &mut hooks, &mut |conversation| {
@@ -165,6 +166,7 @@ fn assert_boundaries(connector: &CodexConnector, ctx: &ScanContext, expected: &[
     let mut hooks = SourceScanHooks {
         should_scan_source: Some(&mut should_scan),
         on_source_complete: Some(&mut complete),
+        tail_resume: None,
     };
     connector
         .scan_with_source_boundaries(ctx, &mut hooks, &mut |_| {

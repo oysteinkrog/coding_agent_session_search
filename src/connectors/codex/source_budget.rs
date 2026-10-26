@@ -322,6 +322,7 @@ fn scan_with_admission(
     let SourceScanHooks {
         should_scan_source,
         on_source_complete,
+        ..
     } = hooks;
     let mut should_scan = |source: &DiscoveredSourceFile| {
         {
@@ -452,6 +453,7 @@ fn scan_with_admission(
     let mut guarded = SourceScanHooks {
         should_scan_source: Some(&mut should_scan),
         on_source_complete: Some(&mut complete),
+        tail_resume: None,
     };
     inner.scan_with_source_boundaries(ctx, &mut guarded, &mut forward)?;
     let mut state = state.into_inner();

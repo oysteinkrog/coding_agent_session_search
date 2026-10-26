@@ -122,6 +122,7 @@ fn configured_preflight_refuses_before_parsing_or_completing_a_source() -> Resul
     let mut hooks = SourceScanHooks {
         should_scan_source: None,
         on_source_complete: Some(&mut complete),
+        tail_resume: None,
     };
     let error = scan_with_admission(
         &franken_agent_detection::CodexConnector::new(),

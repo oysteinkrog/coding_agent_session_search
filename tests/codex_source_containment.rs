@@ -57,6 +57,7 @@ fn oversized_rollout_does_not_hide_later_sources_or_complete_it() -> Result<()> 
     let mut hooks = SourceScanHooks {
         should_scan_source: None,
         on_source_complete: Some(&mut completion),
+        tail_resume: None,
     };
     let error = CodexConnector::new()
         .scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {
@@ -87,6 +88,7 @@ fn oversized_rollout_does_not_hide_later_sources_or_complete_it() -> Result<()> 
     let mut hooks = SourceScanHooks {
         should_scan_source: Some(&mut predicate),
         on_source_complete: None,
+        tail_resume: None,
     };
     assert!(
         CodexConnector::new()
@@ -140,6 +142,7 @@ fn intentionally_excluded_source_is_not_reported_as_an_attempted_failure() -> Re
     let mut hooks = SourceScanHooks {
         should_scan_source: Some(&mut predicate),
         on_source_complete: None,
+        tail_resume: None,
     };
     let mut emitted = Vec::new();
     CodexConnector::new().scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {

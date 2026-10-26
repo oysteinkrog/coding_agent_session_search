@@ -71,6 +71,7 @@ fn custom_remote_roots_keep_distinct_ids_and_original_provenance() -> Result<()>
     let mut hooks = SourceScanHooks {
         should_scan_source: None,
         on_source_complete: Some(&mut complete),
+        tail_resume: None,
     };
     let mut delivered = Vec::new();
     CodexConnector::new().scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {
@@ -114,6 +115,7 @@ fn replacing_an_inventory_file_with_a_directory_cannot_expand_scan_scope() -> Re
     let mut hooks = SourceScanHooks {
         should_scan_source: Some(&mut predicate),
         on_source_complete: Some(&mut complete),
+        tail_resume: None,
     };
     let mut delivered = Vec::new();
     let error = CodexConnector::new()

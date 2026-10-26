@@ -64,6 +64,7 @@ fn assert_routes(ctx: &ScanContext, expected: &[PathBuf]) -> Result<()> {
     let mut hooks = SourceScanHooks {
         should_scan_source: Some(&mut before),
         on_source_complete: Some(&mut complete),
+        tail_resume: None,
     };
     let mut bounded = Vec::new();
     connector.scan_with_source_boundaries(ctx, &mut hooks, &mut |item| {
@@ -370,6 +371,7 @@ fn archive_inventory_reuses_completed_sources_and_admits_new_old_mtime_moves() -
         let mut hooks = SourceScanHooks {
             should_scan_source: Some(&mut predicate),
             on_source_complete: Some(&mut complete),
+            tail_resume: None,
         };
         let mut delivered = Vec::new();
         connector.scan_with_source_boundaries(&ctx, &mut hooks, &mut |item| {

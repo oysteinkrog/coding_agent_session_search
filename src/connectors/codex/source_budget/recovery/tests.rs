@@ -56,6 +56,7 @@ fn unfinished_middle_source_does_not_starve_later_sessions() -> Result<()> {
         let mut hooks = SourceScanHooks {
             should_scan_source: Some(&mut predicate),
             on_source_complete: Some(&mut complete),
+            tail_resume: None,
         };
         let mut delivered = Vec::new();
         let error = connector
@@ -140,6 +141,7 @@ fn consumer_errors_abort_even_after_a_source_local_failure() -> Result<()> {
         let mut hooks = SourceScanHooks {
             should_scan_source: None,
             on_source_complete: Some(&mut complete),
+            tail_resume: None,
         };
         let error = CodexConnector::new()
             .scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {
@@ -175,6 +177,7 @@ fn disappeared_inventory_source_is_not_a_successful_empty_scan() -> Result<()> {
     let mut hooks = SourceScanHooks {
         should_scan_source: None,
         on_source_complete: Some(&mut complete),
+        tail_resume: None,
     };
     let mut delivered = Vec::new();
     let error = CodexConnector::new()

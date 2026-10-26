@@ -198,6 +198,7 @@ fn scan_source(
     let SourceScanHooks {
         should_scan_source,
         on_source_complete,
+        ..
     } = hooks;
     let mut before = |observed: &DiscoveredSourceFile| {
         // A discovered file can become a directory before the explicit scan.
@@ -217,6 +218,7 @@ fn scan_source(
             source: original_identity(done.source.clone(), source),
             required_sidecars: done.required_sidecars.clone(),
             conversations_emitted: done.conversations_emitted,
+            tail: done.tail.clone(),
         };
         on_source_complete
             .as_mut()
@@ -232,6 +234,7 @@ fn scan_source(
     let mut guarded = SourceScanHooks {
         should_scan_source: Some(&mut before),
         on_source_complete: Some(&mut complete),
+        tail_resume: None,
     };
     let result = scan_with_admission(
         inner,

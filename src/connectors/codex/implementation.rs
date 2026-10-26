@@ -1287,6 +1287,7 @@ mod tests {
             let mut hooks = SourceScanHooks {
                 should_scan_source: None,
                 on_source_complete: Some(&mut complete),
+                tail_resume: None,
             };
             assert!(
                 connector
@@ -1312,6 +1313,7 @@ mod tests {
             let mut hooks = SourceScanHooks {
                 should_scan_source: None,
                 on_source_complete: Some(&mut complete),
+                tail_resume: None,
             };
             connector.scan_with_source_boundaries(&ctx, &mut hooks, &mut |conversation| {
                 emitted.push(conversation);

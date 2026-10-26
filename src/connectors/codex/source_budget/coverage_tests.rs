@@ -46,6 +46,7 @@ fn oversized_legacy_rollouts_report_partial_coverage_without_hiding_healthy_sour
     let mut hooks = SourceScanHooks {
         should_scan_source: None,
         on_source_complete: Some(&mut complete),
+        tail_resume: None,
     };
     let connector = super::super::CodexConnector::new();
     let error = connector
@@ -101,6 +102,7 @@ impl Connector for RewriteAfterAdmission {
         let SourceScanHooks {
             should_scan_source,
             on_source_complete,
+            ..
         } = hooks;
         let mut predicate = |source: &DiscoveredSourceFile| {
             let admitted = should_scan_source
@@ -123,6 +125,7 @@ impl Connector for RewriteAfterAdmission {
         let mut guarded = SourceScanHooks {
             should_scan_source: Some(&mut predicate),
             on_source_complete: Some(&mut complete),
+            tail_resume: None,
         };
         franken_agent_detection::CodexConnector::new().scan_with_source_boundaries(
             ctx,
@@ -198,6 +201,7 @@ fn later_appends_to_completed_sources_do_not_fail_the_next_source() -> Result<()
     let mut hooks = SourceScanHooks {
         should_scan_source: Some(&mut predicate),
         on_source_complete: Some(&mut complete),
+        tail_resume: None,
     };
     let mut delivered = Vec::new();
     super::super::CodexConnector::new().scan_with_source_boundaries(

@@ -147,6 +147,7 @@ mod tests {
                 let mut hooks = SourceScanHooks {
                     should_scan_source: None,
                     on_source_complete: Some(&mut complete),
+                    tail_resume: None,
                 };
                 let error = scan(
                     &CodexConnector::new(),
@@ -190,6 +191,7 @@ mod tests {
                 let mut hooks = SourceScanHooks {
                     should_scan_source: None,
                     on_source_complete: Some(&mut complete),
+                    tail_resume: None,
                 };
                 scan(
                     &CodexConnector::new(),
@@ -221,6 +223,7 @@ mod tests {
         let mut hooks = SourceScanHooks {
             should_scan_source: None,
             on_source_complete: Some(&mut complete),
+            tail_resume: None,
         };
         let mut delivered = 0;
         let error = scan(
@@ -275,6 +278,7 @@ mod tests {
         let mut hooks = SourceScanHooks {
             should_scan_source: Some(&mut predicate),
             on_source_complete: Some(&mut complete),
+            tail_resume: None,
         };
         let error = scan(
             &CodexConnector::new(),
