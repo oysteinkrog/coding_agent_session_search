@@ -33227,6 +33227,61 @@ pub mod persist {
         }
     }
 
+    /// Conversations the inline rebuild already replayed in full in this
+    /// process, per database. A large session stored in parts reaches the
+    /// persist step once per part; replaying the whole stored conversation
+    /// for every part made the cost grow with the square of its size (a
+    /// 686 MiB transcript ran for over 6 minutes instead of under 1). A
+    /// conversation replayed earlier in this run needs only its newly
+    /// inserted messages published.
+    static INLINE_REBUILD_REPLAYED: std::sync::LazyLock<std::sync::Mutex<HashSet<(std::path::PathBuf, i64)>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+    fn publish_conversation_for_inline_rebuild(
+        storage: &FrankenStorage,
+        index: &mut TantivyIndex,
+        outcome: &InsertOutcome,
+    ) -> Result<()> {
+        let conversation_id = outcome.conversation_id;
+        let key = storage
+            .database_path()
+            .ok()
+            .map(|path| (path, conversation_id));
+        let replayed_before = key.as_ref().is_some_and(|key| {
+            INLINE_REBUILD_REPLAYED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(key)
+        });
+        if replayed_before && outcome.updated_indices.is_empty() {
+            let changed_indices = changed_message_indices(outcome);
+            if changed_indices.is_empty() {
+                return Ok(());
+            }
+            let packet =
+                lexical_packet_for_changed_messages(storage, conversation_id, &changed_indices)?;
+            let positional = positional_indices_for_inserted(&packet, &changed_indices);
+            if positional.is_empty() {
+                return Ok(());
+            }
+            return publish_changed_packet_messages(
+                index,
+                &packet,
+                &positional,
+                conversation_id,
+                false,
+            );
+        }
+        replay_canonical_conversation_for_rebuild(storage, index, conversation_id)?;
+        if let Some(key) = key {
+            INLINE_REBUILD_REPLAYED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key);
+        }
+        Ok(())
+    }
+
     fn publish_canonical_packet_for_rebuild(
         index: &mut TantivyIndex,
         packet: &ConversationPacket,
@@ -34551,12 +34606,12 @@ pub mod persist {
                     // All outcomes are already persisted, so the first read
                     // for this identity contains its final canonical snapshot.
                     if rebuilt_conversation_ids.insert(outcome.conversation_id) {
-                        replay_canonical_conversation_for_rebuild(
+                        publish_conversation_for_inline_rebuild(
                             storage,
                             t_index
                                 .as_deref_mut()
                                 .expect("inline rebuild requires Tantivy writer"),
-                            outcome.conversation_id,
+                            &outcome,
                         )?;
                     }
                 }
@@ -35751,12 +35806,12 @@ pub mod persist {
                         // Coalesce only lexical replay; every persistence
                         // outcome still contributes accounting and semantics.
                         if rebuilt_conversation_ids.insert(outcome.conversation_id) {
-                            replay_canonical_conversation_for_rebuild(
+                            publish_conversation_for_inline_rebuild(
                                 storage,
                                 t_index
                                     .as_deref_mut()
                                     .expect("inline rebuild requires Tantivy writer"),
-                                outcome.conversation_id,
+                                outcome,
                             )?;
                         }
                     }
