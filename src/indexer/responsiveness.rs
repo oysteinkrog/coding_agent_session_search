@@ -1706,6 +1706,12 @@ fn default_max_inflight_bytes_for_available(available_bytes: Option<u64>) -> usi
 /// root and returns the tightest level's headroom: `memory.max - usage`,
 /// crediting that level's reclaimable `inactive_file` page cache the way
 /// `MemAvailable` does. `None` when no level sets a limit.
+///
+/// On cgroup v2 a level's limit is the lower of `memory.high` and
+/// `memory.max`. Above `memory.high` the kernel throttles every allocation
+/// with direct reclaim, so a budget sized to `memory.max` runs the whole
+/// index at the throttle point (a 6 GB high under a 14 GB max stalled for
+/// hours with all workers in `__mem_cgroup_handle_over_high`).
 #[cfg(any(target_os = "linux", test))]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn cgroup_memory_budget(
@@ -1757,7 +1763,13 @@ fn cgroup_memory_budget(
         let mut level = base.join(relative);
         loop {
             if v2 {
-                if let Some(limit) = number(read(level.join("memory.max"))) {
+                let max = number(read(level.join("memory.max")));
+                let high = number(read(level.join("memory.high")));
+                let limit = match (max, high) {
+                    (Some(max), Some(high)) => Some(max.min(high)),
+                    (max, high) => max.or(high),
+                };
+                if let Some(limit) = limit {
                     let usage = number(read(level.join("memory.current"))).unwrap_or(0);
                     let inactive = stat_field(read(level.join("memory.stat")), "inactive_file");
                     consider(limit, usage, inactive.unwrap_or(0));
@@ -2062,6 +2074,45 @@ mod tests {
                 headroom: GIB
             }
         );
+    }
+
+    /// memory.high below memory.max is the real ceiling: past it the kernel
+    /// throttles every allocation, so the budget must come from it.
+    #[test]
+    fn cgroup_v2_budget_uses_memory_high_when_it_is_below_memory_max() {
+        const GIB: u64 = 1 << 30;
+        let root = cgroup_fixture(&[
+            ("user.slice/memory.max", "max\n"),
+            ("user.slice/cass.service/memory.max", &format!("{}\n", 6 * GIB)),
+            ("user.slice/cass.service/memory.high", &format!("{}\n", 4 * GIB)),
+            ("user.slice/cass.service/memory.current", &format!("{}\n", GIB)),
+        ]);
+        let budget = cgroup_memory_budget("0::/user.slice/cass.service\n", root.path()).unwrap();
+        assert_eq!(
+            budget,
+            CgroupMemoryBudget {
+                limit: 4 * GIB,
+                headroom: 3 * GIB
+            }
+        );
+
+        // A high limit alone (memory.max "max") still bounds the budget.
+        let root = cgroup_fixture(&[
+            ("user.slice/memory.max", "max\n"),
+            ("user.slice/memory.high", &format!("{}\n", 2 * GIB)),
+            ("user.slice/memory.current", "0\n"),
+        ]);
+        let budget = cgroup_memory_budget("0::/user.slice\n", root.path()).unwrap();
+        assert_eq!(budget.limit, 2 * GIB);
+
+        // memory.high above memory.max changes nothing.
+        let root = cgroup_fixture(&[
+            ("user.slice/memory.max", &format!("{}\n", 2 * GIB)),
+            ("user.slice/memory.high", &format!("{}\n", 8 * GIB)),
+            ("user.slice/memory.current", "0\n"),
+        ]);
+        let budget = cgroup_memory_budget("0::/user.slice\n", root.path()).unwrap();
+        assert_eq!(budget.limit, 2 * GIB);
     }
 
     #[test]
