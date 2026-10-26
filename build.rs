@@ -465,10 +465,46 @@ fn emit_source_ingest_contract(manifest_dir: &Path) {
         hasher.update(value.as_bytes());
         hasher.update(b"\0");
     }
-    println!(
-        "cargo:rustc-env=CASS_SOURCE_INGEST_CONTRACT={}",
-        hasher.finalize()
-    );
+    let computed = hasher.finalize().to_hex().to_string();
+    let contract = pinned_source_ingest_contract(manifest_dir).unwrap_or(computed);
+    println!("cargo:rustc-env=CASS_SOURCE_INGEST_CONTRACT={contract}");
+}
+
+/// LOCAL PIN (localbuilds recipe "cass"), not for upstream.
+///
+/// The contract hash covers every file under src/, so any local patch, even
+/// one that leaves parse output identical, makes the next index run re-parse
+/// the whole corpus (about 100,000 transcripts here). A pin keeps the
+/// contract of an earlier build so its ledger entries stay valid.
+///
+/// The pin comes from `CASS_SOURCE_INGEST_CONTRACT_PIN` at build time, or
+/// else from the first non-comment line of `source-ingest-contract.pin` in
+/// the crate root. Use it only for patches that keep the stored messages of
+/// every source identical. Remove it when the parser output changes or the
+/// branch moves to a new upstream release.
+fn pinned_source_ingest_contract(manifest_dir: &Path) -> Option<String> {
+    println!("cargo:rerun-if-env-changed=CASS_SOURCE_INGEST_CONTRACT_PIN");
+    let pin_file = manifest_dir.join("source-ingest-contract.pin");
+    println!("cargo:rerun-if-changed={}", pin_file.display());
+    let pin = env::var("CASS_SOURCE_INGEST_CONTRACT_PIN")
+        .ok()
+        .filter(|pin| !pin.trim().is_empty())
+        .or_else(|| {
+            fs::read_to_string(&pin_file).ok().and_then(|text| {
+                text.lines()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty() && !line.starts_with('#'))
+                    .map(str::to_string)
+            })
+        })?;
+    let pin = pin.trim().to_ascii_lowercase();
+    if pin.len() != 64 || !pin.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        fatal(format!(
+            "source ingest contract pin must be 64 hex digits, got {pin:?}"
+        ));
+    }
+    println!("cargo:warning=source ingest contract pinned to {pin}");
+    Some(pin)
 }
 
 /// Embed the build commit at compile time (GH #399).

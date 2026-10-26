@@ -1,0 +1,9 @@
+# Source ingest contract pin (local only, read by build.rs).
+#
+# This is the contract of the installed build 54ed6b4f (local/v0.10.0-cuda).
+# The streaming and tail-ingest patches on local/v0.10.0-stream store the same
+# messages, indexes and conversation rows as 54ed6b4f, so its ledger entries
+# stay valid and the first run of this build does not re-parse every source.
+# Remove this file when the parser output changes or the branch moves to a new
+# upstream release.
+77f4aaea206ccf6e082dd74de49ed0655cd07af972b161f6071ebf9b9ca4516d
