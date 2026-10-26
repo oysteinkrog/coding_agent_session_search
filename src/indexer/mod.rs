@@ -52897,6 +52897,141 @@ mod tests {
         assert!(!source_ledger_matches(&saved, &source));
     }
 
+    /// A ledger entry with a tail, as the completion hook writes it after a
+    /// scan that consumed `consumed` bytes of `path`.
+    fn tail_ledger_entry(path: &Path, consumed: u64, next_idx: i64) -> String {
+        let bytes = std::fs::read(path).unwrap();
+        let from = consumed.saturating_sub(4096) as usize;
+        let tail = franken_agent_detection::connectors::SourceTailState {
+            offset: consumed,
+            next_idx,
+            carried: serde_json::json!({"v": 1}),
+            prefix: bytes[from..consumed as usize].to_vec(),
+            resumed: false,
+        };
+        let mut primary = source_file_observation(path).unwrap();
+        primary["size"] = serde_json::json!(consumed);
+        serde_json::json!({"primary":primary,"dependencies":[],
+            "producer_contract":env!("CASS_SOURCE_INGEST_CONTRACT"),
+            "tail":source_ledger_tail(&primary, &tail)})
+        .to_string()
+    }
+
+    fn jsonl_bytes(lines: std::ops::Range<usize>) -> Vec<u8> {
+        lines
+            .map(|i| format!("{{\"type\":\"user\",\"n\":{i},\"pad\":\"{}\"}}\n", "x".repeat(300)))
+            .collect::<String>()
+            .into_bytes()
+    }
+
+    #[test]
+    fn source_ledger_tail_resumes_an_appended_file() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("session.jsonl");
+        std::fs::write(&path, jsonl_bytes(0..40)).unwrap();
+        let consumed = std::fs::metadata(&path).unwrap().len();
+        let saved = tail_ledger_entry(&path, consumed, 40);
+        let source = DiscoveredSourceFile::new(
+            "claude_code",
+            &ScanRoot::local(temp.path().to_path_buf()),
+            path.clone(),
+            crate::connectors::DiscoveredSourceRole::PrimarySessionLog,
+            true,
+        )
+        .with_fs_metadata();
+        assert!(
+            source_ledger_matches(&saved, &source),
+            "an unchanged, fully consumed file is skipped as before"
+        );
+        let resume = source_ledger_tail_resume(&saved, &path).expect("unchanged file resumes");
+        assert_eq!((resume.offset, resume.next_idx), (consumed, 40));
+
+        // Append: same inode, longer, same prefix.
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(&jsonl_bytes(40..45)).unwrap();
+        drop(file);
+        assert!(!source_ledger_matches(&saved, &source.clone().with_fs_metadata()));
+        let resume = source_ledger_tail_resume(&saved, &path).expect("an append resumes");
+        assert_eq!(resume.offset, consumed);
+        assert_eq!(resume.next_idx, 40);
+        assert_eq!(resume.carried, serde_json::json!({"v": 1}));
+    }
+
+    #[test]
+    fn source_ledger_tail_falls_back_when_the_file_is_not_an_append() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("session.jsonl");
+        let original = jsonl_bytes(0..40);
+        std::fs::write(&path, &original).unwrap();
+        let consumed = original.len() as u64;
+        let saved = tail_ledger_entry(&path, consumed, 40);
+
+        // Truncated below the offset.
+        std::fs::write(&path, &original[..original.len() / 2]).unwrap();
+        assert!(source_ledger_tail_resume(&saved, &path).is_none(), "truncated");
+
+        // Same length, but a byte just before the offset changed (written in
+        // place, so the inode stays).
+        std::fs::write(&path, &original).unwrap();
+        let saved = tail_ledger_entry(&path, consumed, 40);
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(std::io::SeekFrom::Start(consumed - 10)).unwrap();
+        file.write_all(b"Y").unwrap();
+        drop(file);
+        assert!(source_ledger_tail_resume(&saved, &path).is_none(), "prefix changed");
+
+        // Replaced by a new file (new inode) with the same bytes plus more.
+        std::fs::write(&path, &original).unwrap();
+        let saved = tail_ledger_entry(&path, consumed, 40);
+        let replacement = temp.path().join("replacement.jsonl");
+        let mut grown = original.clone();
+        grown.extend(jsonl_bytes(40..42));
+        std::fs::write(&replacement, &grown).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert!(source_ledger_tail_resume(&saved, &path).is_none(), "new inode");
+
+        // Entries from another contract, or without a tail, never resume.
+        std::fs::write(&path, &original).unwrap();
+        let saved = tail_ledger_entry(&path, consumed, 40);
+        let mut other: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        other["producer_contract"] = serde_json::json!("other");
+        assert!(source_ledger_tail_resume(&other.to_string(), &path).is_none());
+        other["producer_contract"] = serde_json::json!(env!("CASS_SOURCE_INGEST_CONTRACT"));
+        other.as_object_mut().unwrap().remove("tail");
+        assert!(source_ledger_tail_resume(&other.to_string(), &path).is_none());
+        assert!(source_ledger_tail_resume("{}", &path).is_none());
+    }
+
+    #[test]
+    fn same_session_parts_never_share_a_streaming_batch() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let limiter = Arc::new(StreamingByteLimiter::new(STREAMING_MAX_BYTES_IN_FLIGHT));
+        let mut sender = StreamingBatchSender::new(&tx, limiter, "claude_code", true);
+        let part = |first_idx: i64| {
+            let mut conv = norm_conv(Some("proj/session.jsonl"), vec![norm_msg(first_idx, 10)]);
+            conv.agent_slug = "claude_code".to_string();
+            conv.source_path = PathBuf::from("/p/session.jsonl");
+            conv
+        };
+        let mut other = part(0);
+        other.external_id = Some("proj/other.jsonl".into());
+        other.source_path = PathBuf::from("/p/other.jsonl");
+        sender.push(part(0)).unwrap();
+        sender.push(part(1)).unwrap();
+        sender.push(part(2)).unwrap();
+        sender.push(other).unwrap();
+        sender.flush().unwrap();
+        drop(sender);
+        let batches: Vec<usize> = rx
+            .try_iter()
+            .map(|message| match message {
+                IndexMessage::Batch { conversations, .. } => conversations.len(),
+                _ => 0,
+            })
+            .collect();
+        assert_eq!(batches, vec![1, 1, 2], "each part alone; a different session may join");
+    }
+
     #[test]
     fn streaming_configured_scan_roots_ignore_global_watermark() -> Result<()> {
         let tmp = TempDir::new()?;
