@@ -3,6 +3,7 @@
 //! leave the archive, search and display exactly as one full parse would.
 
 use assert_cmd::Command;
+use coding_agent_search::franken_sync::compat::RowExt;
 use coding_agent_search::storage::sqlite::SqliteStorage;
 use serde_json::Value;
 use std::fs;
