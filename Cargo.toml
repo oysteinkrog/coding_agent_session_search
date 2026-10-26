@@ -422,3 +422,9 @@ path = "tests/upgrade/mod.rs"
 [[test]]
 name = "recovery"
 path = "tests/recovery/mod.rs"
+
+# LOCAL (localbuilds recipe "cass"): fsqlite-core 0.4.6 with the clean-root
+# probe starting past the end of the database (a `sqlite_master` query read the
+# whole 29 GB file into memory). A `git` source, never `path`.
+[patch.crates-io]
+fsqlite-core = { git = "file:///var/tmp/claude/cass-stream/fsqlite", rev = "959e4942883fbe70fa4bae56a7d45a1be2b43a31" }
