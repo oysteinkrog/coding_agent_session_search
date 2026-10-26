@@ -13862,6 +13862,7 @@ fn source_ledger_tail(
         "file_inode": tail.inode,
         "head_len": tail.head_len,
         "head_blake3": tail.head_blake3,
+        "samples_blake3": tail.samples_blake3,
         "prefix_len": tail.prefix.len(),
         "prefix_blake3": blake3::hash(&tail.prefix).to_hex().to_string(),
     })
@@ -13893,6 +13894,7 @@ fn source_ledger_tail_resume(
     let inode = tail["file_inode"].as_u64()?;
     let head_len = tail["head_len"].as_u64()?;
     let head_blake3 = tail["head_blake3"].as_str()?;
+    let samples_blake3 = tail["samples_blake3"].as_str()?;
     if offset == 0 || next_idx < 0 || prefix_len != offset.min(PREFIX) {
         return None;
     }
@@ -13937,6 +13939,7 @@ fn source_ledger_tail_resume(
         head_len,
         head_blake3: head_blake3.to_string(),
         prefix_blake3: expected.to_string(),
+        samples_blake3: samples_blake3.to_string(),
     })
 }
 
@@ -53026,6 +53029,7 @@ mod tests {
             head_blake3: blake3::hash(&bytes[..consumed.min(64 * 1024) as usize])
                 .to_hex()
                 .to_string(),
+            samples_blake3: "test".to_string(),
         };
         let mut primary = source_file_observation(path).unwrap();
         primary["size"] = serde_json::json!(consumed);
