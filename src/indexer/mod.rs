@@ -13782,11 +13782,23 @@ fn source_observation_matches(saved: &serde_json::Value, path: &Path) -> bool {
     source_file_observation(path).is_some_and(|current| current == saved)
 }
 
+/// Whether a ledger entry's producer contract is this build's, or an earlier
+/// one listed as accepted in `source-ingest-contract.pin` (local patch).
+fn source_ingest_contract_accepted(contract: Option<&str>) -> bool {
+    let Some(contract) = contract else {
+        return false;
+    };
+    contract == env!("CASS_SOURCE_INGEST_CONTRACT")
+        || env!("CASS_SOURCE_INGEST_CONTRACT_ACCEPTED")
+            .split(',')
+            .any(|accepted| !accepted.is_empty() && accepted == contract)
+}
+
 fn source_ledger_matches(observation: &str, source: &DiscoveredSourceFile) -> bool {
     let Ok(saved) = serde_json::from_str::<serde_json::Value>(observation) else {
         return false;
     };
-    if saved["producer_contract"].as_str() != Some(env!("CASS_SOURCE_INGEST_CONTRACT")) {
+    if !source_ingest_contract_accepted(saved["producer_contract"].as_str()) {
         return false;
     }
     if !source_observation_matches(&saved["primary"], &source.source_path) {
@@ -13859,7 +13871,7 @@ fn source_ledger_tail_resume(
     use std::io::Read;
     const PREFIX: u64 = franken_agent_detection::connectors::SOURCE_TAIL_PREFIX_BYTES as u64;
     let saved = serde_json::from_str::<serde_json::Value>(observation).ok()?;
-    if saved["producer_contract"].as_str() != Some(env!("CASS_SOURCE_INGEST_CONTRACT")) {
+    if !source_ingest_contract_accepted(saved["producer_contract"].as_str()) {
         return None;
     }
     let tail = saved.get("tail")?;

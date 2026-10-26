@@ -468,6 +468,34 @@ fn emit_source_ingest_contract(manifest_dir: &Path) {
     let computed = hasher.finalize().to_hex().to_string();
     let contract = pinned_source_ingest_contract(manifest_dir).unwrap_or(computed);
     println!("cargo:rustc-env=CASS_SOURCE_INGEST_CONTRACT={contract}");
+    let accepted = accepted_source_ingest_contracts(manifest_dir).join(",");
+    println!("cargo:rustc-env=CASS_SOURCE_INGEST_CONTRACT_ACCEPTED={accepted}");
+}
+
+/// LOCAL (localbuilds recipe "cass"), not for upstream.
+///
+/// Earlier contracts whose ledger entries this build still trusts, from
+/// `accept <64 hex digits>` lines in `source-ingest-contract.pin`. Add one only
+/// after checking that the earlier build stores the same rows for the sources
+/// it recorded; new ledger entries always carry the current contract.
+fn accepted_source_ingest_contracts(manifest_dir: &Path) -> Vec<String> {
+    let pin_file = manifest_dir.join("source-ingest-contract.pin");
+    let Ok(text) = fs::read_to_string(&pin_file) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| line.trim().strip_prefix("accept "))
+        .map(|hash| {
+            let hash = hash.trim().to_ascii_lowercase();
+            if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                fatal(format!(
+                    "accepted source ingest contract must be 64 hex digits, got {hash:?}"
+                ));
+            }
+            println!("cargo:warning=source ingest contract also accepts {hash}");
+            hash
+        })
+        .collect()
 }
 
 /// LOCAL PIN (localbuilds recipe "cass"), not for upstream.
@@ -493,7 +521,9 @@ fn pinned_source_ingest_contract(manifest_dir: &Path) -> Option<String> {
             fs::read_to_string(&pin_file).ok().and_then(|text| {
                 text.lines()
                     .map(str::trim)
-                    .find(|line| !line.is_empty() && !line.starts_with('#'))
+                    .find(|line| {
+                        !line.is_empty() && !line.starts_with('#') && !line.starts_with("accept ")
+                    })
                     .map(str::to_string)
             })
         })?;

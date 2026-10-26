@@ -7,3 +7,9 @@
 # Remove this file when the parser output changes or the branch moves to a new
 # upstream release.
 77f4aaea206ccf6e082dd74de49ed0655cd07af972b161f6071ebf9b9ca4516d
+
+# Ledger entries from the 4773d03e build (contract c01f9a85) are accepted too.
+# FAD 0.3.2 to 0.3.3 changed only the opencode and openclaw parsers, all
+# 80,352 entries on that contract are Claude Code transcripts, and a spot check
+# of 20 of them (2026-10-26) found the same rows as a fresh index by 54ed6b4f.
+accept c01f9a85a83afd5c7e53a6321caf693511f363f108feb41d861d0ced428cfd6b
