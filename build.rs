@@ -599,6 +599,10 @@ fn validate_fsqlite_source_pin(manifest_dir: &Path, manifest: &Value, packaged_m
     // the uniform published 0.4.6 version, including the shared types.
     // One source per package remains load-bearing for read-only integrity.
     const EXPECTED_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+    // LOCAL (localbuilds recipe "cass"): fsqlite-core 0.4.6 comes from the
+    // reviewed local fork with the clean-root probe fix. Only this member, and
+    // only from a git source.
+    const LOCAL_PATCHED_MEMBER: &str = "fsqlite-core";
 
     // 1. With the family on crates.io (e926644f), a `[patch]` table is no
     //    longer required — but if one exists, it must not silently redirect
@@ -608,6 +612,9 @@ fn validate_fsqlite_source_pin(manifest_dir: &Path, manifest: &Value, packaged_m
         && let Some(crates_io) = patch_tables.get("crates-io").and_then(Value::as_table)
     {
         for dependency in crates_io.keys() {
+            if dependency == LOCAL_PATCHED_MEMBER {
+                continue;
+            }
             if dependency == "fsqlite" || dependency.starts_with("fsqlite-") {
                 fatal(format!(
                     "dependency source contract violation for {dependency}: the fsqlite \
@@ -682,7 +689,8 @@ fn validate_fsqlite_source_pin(manifest_dir: &Path, manifest: &Value, packaged_m
             ));
         }
         let source = package.get("source").and_then(Value::as_str).unwrap_or("");
-        if source != EXPECTED_REGISTRY_SOURCE {
+        let local_fork = name == LOCAL_PATCHED_MEMBER && source.starts_with("git+");
+        if source != EXPECTED_REGISTRY_SOURCE && !local_fork {
             violations.push(format!(
                 "`{name}` resolves from `{source}`, expected the crates.io registry \
                  (`{EXPECTED_REGISTRY_SOURCE}`)"
