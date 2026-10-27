@@ -159,7 +159,9 @@ fn a_rollout_whose_kept_tool_output_was_cut_is_delivered_but_never_certified() -
             Ok(())
         },
         |conversation| {
-            conversation.messages.retain(|message| message.role != "tool");
+            conversation
+                .messages
+                .retain(|message| message.role != "tool");
             super::super::augment_modern_codex_messages(conversation, None)
         },
     )?;
