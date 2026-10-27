@@ -75,7 +75,7 @@ fn oversized_legacy_rollouts_report_partial_coverage_without_hiding_healthy_sour
 }
 
 #[test]
-fn a_rollout_with_cut_tool_output_is_delivered_but_never_certified() -> Result<()> {
+fn a_long_tool_output_kept_whole_by_fad_still_certifies_its_rollout() -> Result<()> {
     let (_root, paths, ctx) = corpus("jsonl")?;
     let output = serde_json::json!({
         "type": "response_item",
@@ -92,6 +92,52 @@ fn a_rollout_with_cut_tool_output_is_delivered_but_never_certified() -> Result<(
             record("b")
         ),
     )?;
+    let mut completed = Vec::new();
+    let mut complete = |done: &SourceCompletion| {
+        completed.push(done.source.source_path.clone());
+        Ok(())
+    };
+    let mut hooks = SourceScanHooks {
+        should_scan_source: None,
+        on_source_complete: Some(&mut complete),
+        tail_resume: None,
+    };
+    let mut longest = 0;
+    super::super::CodexConnector::new().scan_with_source_boundaries(
+        &ctx,
+        &mut hooks,
+        &mut |conversation| {
+            for message in &conversation.messages {
+                assert!(
+                    !message
+                        .content
+                        .contains("additional chars from tool output")
+                );
+                longest = longest.max(message.content.len());
+            }
+            Ok(())
+        },
+    )?;
+    assert!(longest >= 200_000, "the tool output is stored whole");
+    assert_eq!(
+        completed, paths,
+        "nothing was cut, so every rollout completes"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_rollout_whose_kept_tool_output_was_cut_is_delivered_but_never_certified() -> Result<()> {
+    let (_root, paths, ctx) = corpus("jsonl")?;
+    let output = serde_json::json!({
+        "type": "response_item",
+        "payload": {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "z".repeat(200_000),
+        },
+    });
+    fs::write(&paths[1], format!("{output}\n"))?;
     let mut delivered = Vec::new();
     let mut completed = Vec::new();
     let mut complete = |done: &SourceCompletion| {
@@ -103,24 +149,21 @@ fn a_rollout_with_cut_tool_output_is_delivered_but_never_certified() -> Result<(
         on_source_complete: Some(&mut complete),
         tail_resume: None,
     };
-    let mut cut_text = None;
-    super::super::CodexConnector::new().scan_with_source_boundaries(
+    // Drop FAD's whole copy so the real enrichment pass keeps its cut one.
+    scan(
+        &franken_agent_detection::CodexConnector::new(),
         &ctx,
         &mut hooks,
         &mut |conversation| {
-            if conversation.source_path == paths[1] {
-                cut_text = conversation
-                    .messages
-                    .iter()
-                    .find(|message| message.content.contains("additional chars from tool output"))
-                    .map(|message| message.content.len());
-            }
             delivered.push(conversation.source_path);
             Ok(())
         },
+        |conversation| {
+            conversation.messages.retain(|message| message.role != "tool");
+            super::super::augment_modern_codex_messages(conversation, None)
+        },
     )?;
     assert_eq!(delivered, paths, "every rollout is still delivered");
-    assert!(cut_text.is_some(), "the long tool output is indexed with a marker");
     assert_eq!(
         completed,
         [paths[0].clone(), paths[2].clone()],

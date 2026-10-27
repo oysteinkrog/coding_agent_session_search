@@ -22,8 +22,9 @@ const MAX_INDEXED_TOOL_OUTPUT_CHARS: usize = 128 * 1024;
 
 thread_local! {
     /// Tool outputs cut on this thread since the last `take_cut_tool_outputs`.
-    /// The source budget reads it after enrichment, so a source with cut text
-    /// is never certified complete.
+    /// After an enrichment pass it holds only the cuts in messages that pass
+    /// kept; the source budget reads it so a source with cut text is never
+    /// certified complete.
     static CUT_TOOL_OUTPUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -233,6 +234,9 @@ fn augment_modern_codex_reader(
         .map(|(index, message)| (modern_codex_raw_signature(&message.extra), index))
         .collect();
     let mut added = false;
+    // Cuts in messages this pass keeps. A cut in a candidate that matches a
+    // message FAD already stored whole is discarded with the candidate.
+    let mut kept_cuts = 0_usize;
     let mut line = String::new();
     let mut bytes_read = 0_u64;
     let mut line_no = 0_usize;
@@ -285,7 +289,10 @@ fn augment_modern_codex_reader(
             }
         };
         let raw_signature = modern_codex_raw_signature(&raw);
-        let Some(message) = modern_codex_message(&raw) else {
+        take_cut_tool_outputs();
+        let message = modern_codex_message(&raw);
+        let cut = take_cut_tool_outputs();
+        let Some(message) = message else {
             continue;
         };
         let message_signature = modern_codex_message_signature(&message);
@@ -308,6 +315,7 @@ fn augment_modern_codex_reader(
         if let Some(existing_index) = existing_index {
             let existing = &mut conversation.messages[existing_index];
             if merge_modern_codex_tool_call(existing, &message) {
+                kept_cuts = kept_cuts.saturating_add(cut);
                 message_indices_by_signature
                     .insert(modern_codex_message_signature(existing), existing_index);
                 message_indices_by_call_id.extend(
@@ -319,6 +327,7 @@ fn augment_modern_codex_reader(
             continue;
         }
 
+        kept_cuts = kept_cuts.saturating_add(cut);
         let message_index = conversation.messages.len();
         conversation.messages.push(message);
         let stored = &conversation.messages[message_index];
@@ -337,6 +346,7 @@ fn augment_modern_codex_reader(
         });
         reindex_messages(&mut conversation.messages);
     }
+    CUT_TOOL_OUTPUTS.with(|count| count.set(count.get().saturating_add(kept_cuts)));
     Ok(bytes_read)
 }
 
@@ -811,7 +821,8 @@ mod tests {
         assert_eq!(take_cut_tool_outputs(), 0);
         let over = "a".repeat(MAX_INDEXED_TOOL_OUTPUT_CHARS + 1);
         assert!(
-            truncate_tool_output(&over).ends_with("[truncated 1 additional chars from tool output]")
+            truncate_tool_output(&over)
+                .ends_with("[truncated 1 additional chars from tool output]")
         );
         assert_eq!(take_cut_tool_outputs(), 1);
     }
@@ -1017,6 +1028,45 @@ mod tests {
             parsed.content,
             "[Tool: exec_command]\n{\"cmd\":\"git status\"}"
         );
+    }
+
+    #[test]
+    fn only_a_cut_tool_output_the_pass_keeps_counts_as_cut() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("rollout-long-output.jsonl");
+        let output = response(serde_json::json!({
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "z".repeat(MAX_INDEXED_TOOL_OUTPUT_CHARS + 10),
+        }));
+        std::fs::write(&path, format!("{output}\n"))?;
+
+        // Nothing stored yet: the pass adds the cut output, so it counts.
+        take_cut_tool_outputs();
+        let mut conversation = conversation_at(&path);
+        augment_modern_codex_messages(&mut conversation, None)?;
+        assert!(
+            conversation.messages[0]
+                .content
+                .contains("[truncated 10 additional chars")
+        );
+        assert_eq!(take_cut_tool_outputs(), 1);
+
+        // The same record already stored whole (as FAD stores it): the cut
+        // candidate is dropped and nothing counts as cut.
+        let mut whole = conversation_at(&path);
+        let mut stored = modern_codex_message(&output).expect("tool output");
+        stored.content = "z".repeat(MAX_INDEXED_TOOL_OUTPUT_CHARS + 10);
+        whole.messages.push(stored);
+        take_cut_tool_outputs();
+        augment_modern_codex_messages(&mut whole, None)?;
+        assert_eq!(whole.messages.len(), 1);
+        assert_eq!(
+            whole.messages[0].content.len(),
+            MAX_INDEXED_TOOL_OUTPUT_CHARS + 10
+        );
+        assert_eq!(take_cut_tool_outputs(), 0);
+        Ok(())
     }
 
     #[test]
