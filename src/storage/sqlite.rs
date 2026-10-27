@@ -4931,6 +4931,18 @@ const LEXICAL_LONG_ROW_BYTES: usize = 32 * 1024 * 1024;
 
 static LEXICAL_LONG_ROWS_LOADED: AtomicU64 = AtomicU64::new(0);
 
+/// Time spent finding chunk overlaps, and how many lookups, in this process.
+static LEXICAL_OVERLAP_LOOKUP_NANOS: AtomicU64 = AtomicU64::new(0);
+static LEXICAL_OVERLAP_LOOKUPS: AtomicU64 = AtomicU64::new(0);
+
+/// `(lookups, seconds)` spent finding chunk overlaps in this process.
+pub fn lexical_chunk_overlap_lookup_cost() -> (u64, f64) {
+    (
+        LEXICAL_OVERLAP_LOOKUPS.load(Ordering::Relaxed),
+        LEXICAL_OVERLAP_LOOKUP_NANOS.load(Ordering::Relaxed) as f64 / 1e9,
+    )
+}
+
 /// How many rows over 32 MiB the lexical readers have loaded whole in this
 /// process.
 pub fn lexical_long_rows_loaded() -> u64 {
@@ -12117,6 +12129,25 @@ impl FrankenStorage {
     /// conversation without such rows costs one indexed query; each candidate
     /// is then checked against both rows' chunk records.
     pub(crate) fn lexical_chunk_overlaps(
+        &self,
+        scope: &LexicalOverlapScope,
+    ) -> Result<HashMap<(i64, i64), String>> {
+        let started = std::time::Instant::now();
+        let overlaps = self.lexical_chunk_overlaps_uncounted(scope);
+        let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let total = LEXICAL_OVERLAP_LOOKUP_NANOS.fetch_add(nanos, Ordering::Relaxed) + nanos;
+        let calls = LEXICAL_OVERLAP_LOOKUPS.fetch_add(1, Ordering::Relaxed) + 1;
+        if calls % 10_000 == 0 {
+            tracing::info!(
+                calls,
+                seconds = total as f64 / 1e9,
+                "chunk overlap lookups so far (the per-row size check)"
+            );
+        }
+        overlaps
+    }
+
+    fn lexical_chunk_overlaps_uncounted(
         &self,
         scope: &LexicalOverlapScope,
     ) -> Result<HashMap<(i64, i64), String>> {
