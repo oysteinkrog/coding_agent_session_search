@@ -33495,13 +33495,15 @@ pub mod persist {
     }
 
     /// Conversations the inline rebuild already replayed in full in this
-    /// process, per database. A large session stored in parts reaches the
+    /// process, per database and lexical index. A large session stored in parts reaches the
     /// persist step once per part; replaying the whole stored conversation
     /// for every part made the cost grow with the square of its size (a
     /// 686 MiB transcript ran for over 6 minutes instead of under 1). A
     /// conversation replayed earlier in this run needs only its newly
     /// inserted messages published.
-    static INLINE_REBUILD_REPLAYED: std::sync::LazyLock<std::sync::Mutex<HashSet<(std::path::PathBuf, i64)>>> =
+    static INLINE_REBUILD_REPLAYED: std::sync::LazyLock<
+        std::sync::Mutex<HashSet<(std::path::PathBuf, std::path::PathBuf, i64)>>,
+    > =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
 
     fn publish_conversation_for_inline_rebuild(
@@ -33510,10 +33512,12 @@ pub mod persist {
         outcome: &InsertOutcome,
     ) -> Result<()> {
         let conversation_id = outcome.conversation_id;
+        // A replay into one index says nothing about another index fed from
+        // the same database.
         let key = storage
             .database_path()
             .ok()
-            .map(|path| (path, conversation_id));
+            .map(|path| (path, index.path().to_path_buf(), conversation_id));
         let replayed_before = key.as_ref().is_some_and(|key| {
             INLINE_REBUILD_REPLAYED
                 .lock()
