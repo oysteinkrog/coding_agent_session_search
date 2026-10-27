@@ -27487,6 +27487,58 @@ fn oom_retry_split_point(conv: &NormalizedConversation) -> Option<usize> {
         .find(|&index| !continues_chunk(&conv.messages[index]))
 }
 
+/// Ingest one piece of a conversation that ran out of memory, as two smaller
+/// pieces if it runs out again. Returns the OOM of a piece that cannot be
+/// split. Pieces are not counted in progress nor recorded in quarantine:
+/// the caller does both for the whole conversation.
+fn ingest_oom_retry_piece(
+    storage: &FrankenStorage,
+    data_dir: &Path,
+    piece: NormalizedConversation,
+    defer_checkpoints: bool,
+    progress_bump: Option<&Arc<AtomicI64>>,
+) -> Result<NonWatchIngestOutcome> {
+    let error = match ingest_non_watch_batch_once(
+        storage,
+        None,
+        data_dir,
+        std::slice::from_ref(&piece),
+        &None,
+        LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+        defer_checkpoints,
+        progress_bump,
+    ) {
+        Err(error) if error_is_out_of_memory(&error) => error,
+        other => return other,
+    };
+    let Some(split_at) = oom_retry_split_point(&piece) else {
+        return Err(error);
+    };
+    let base = conversation_without_messages(&piece);
+    let mut left = piece.messages;
+    let right = left.split_off(split_at);
+    let outcome = ingest_oom_retry_piece(
+        storage,
+        data_dir,
+        NormalizedConversation {
+            messages: left,
+            ..base.clone()
+        },
+        defer_checkpoints,
+        progress_bump,
+    )?;
+    Ok(outcome.accumulate(ingest_oom_retry_piece(
+        storage,
+        data_dir,
+        NormalizedConversation {
+            messages: right,
+            ..base
+        },
+        defer_checkpoints,
+        progress_bump,
+    )?))
+}
+
 fn conversation_without_messages(conv: &NormalizedConversation) -> NormalizedConversation {
     NormalizedConversation {
         agent_slug: conv.agent_slug.clone(),
@@ -27510,7 +27562,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
     lexical_strategy: LexicalPopulationStrategy,
     defer_checkpoints: bool,
     progress_bump: Option<&Arc<AtomicI64>>,
-    error: anyhow::Error,
+    mut error: anyhow::Error,
 ) -> Result<NonWatchIngestOutcome> {
     if lexical_population_strategy_requires_inline_tantivy(lexical_strategy) {
         tracing::warn!(
@@ -27586,8 +27638,11 @@ fn ingest_non_watch_oom_retry_or_quarantine(
 
     // One conversation too big to ingest at once goes in as two halves, as
     // a long session's parts do: storage appends the second half to the
-    // first. Each half splits again on OOM, so only one message (or one
-    // split message, kept whole) that still runs out of memory is deferred.
+    // first. Each half splits again on OOM. Only when a piece that cannot be
+    // split (one message, or one message split into chunks) still runs out of
+    // memory does the whole conversation go on to the defer-or-quarantine
+    // path below, under its own identity; the next run ingests it again and
+    // storage adds the messages still missing.
     if let Some(split_at) = oom_retry_split_point(conv) {
         tracing::warn!(
             agent = %conv.agent_slug,
@@ -27598,30 +27653,42 @@ fn ingest_non_watch_oom_retry_or_quarantine(
             error = %error,
             "single non-watch conversation ran out of memory; retrying it as two halves"
         );
-        let mut outcome = NonWatchIngestOutcome::default();
+        let base = conversation_without_messages(conv);
+        let mut halves = NonWatchIngestOutcome::default();
+        let mut piece_error = None;
         for range in [0..split_at, split_at..conv.messages.len()] {
             // Clone one half at a time, so the retry holds at most one copy.
             let half = NormalizedConversation {
                 messages: conv.messages[range].to_vec(),
-                ..conversation_without_messages(conv)
+                ..base.clone()
             };
-            outcome = outcome.accumulate(ingest_non_watch_batch_with_oom_split(
-                storage,
-                None,
-                data_dir,
-                std::slice::from_ref(&half),
-                progress,
-                LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
-                defer_checkpoints,
-                progress_bump,
-            )?);
+            match ingest_oom_retry_piece(storage, data_dir, half, defer_checkpoints, progress_bump)
+            {
+                Ok(outcome) => halves = halves.accumulate(outcome),
+                Err(piece) if error_is_out_of_memory(&piece) => {
+                    piece_error = Some(piece);
+                    break;
+                }
+                Err(piece) => return Err(piece),
+            }
         }
-        // The two halves counted as two conversations; this is one.
-        if let Some(progress) = progress {
-            progress.current.fetch_sub(1, Ordering::Relaxed);
+        match piece_error {
+            None => {
+                clear_poison_conversations_after_successful_ingest(
+                    data_dir,
+                    INDEX_INGEST_POISON_FILE,
+                    "index-ingest-out-of-memory",
+                    std::slice::from_ref(conv),
+                );
+                if let Some(progress) = progress {
+                    progress.current.fetch_add(1, Ordering::Relaxed);
+                }
+                bump_index_run_lock_progress_if_present(progress_bump);
+                halves.lexical_update_deferred = true;
+                return Ok(halves);
+            }
+            Some(piece) => error = piece,
         }
-        outcome.lexical_update_deferred = true;
-        return Ok(outcome);
     }
 
     // #298: mirror the watch-path plausibility gate. frankensqlite raises the
@@ -51766,6 +51833,36 @@ mod tests {
                     row.get_typed(0)
                 })?;
         anyhow::ensure!(conversations == 1, "the halves join into one conversation");
+
+        // When even one message runs out of memory, the whole conversation is
+        // deferred under its own identity, and counted once.
+        let grown = norm_conv(
+            Some("oom-halves"),
+            (0..10)
+                .map(|idx| norm_msg(idx, 1_700_000_000_000 + idx))
+                .collect(),
+        );
+        let previous = NON_WATCH_INGEST_TEST_OOM_MIN_MESSAGES.with(|cell| cell.replace(Some(1)));
+        let outcome = ingest_non_watch_batch_with_oom_split(
+            &storage,
+            None,
+            &data_dir,
+            std::slice::from_ref(&grown),
+            &progress,
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            true,
+            None,
+        );
+        NON_WATCH_INGEST_TEST_OOM_MIN_MESSAGES.with(|cell| cell.set(previous));
+        let outcome = outcome?;
+        anyhow::ensure!(
+            outcome.deferred_sources.contains(&grown.source_path),
+            "the source is read again next run"
+        );
+        anyhow::ensure!(
+            progress_tracker.current.load(Ordering::Relaxed) == 2,
+            "the deferred conversation is counted once"
+        );
         Ok(())
     }
 
