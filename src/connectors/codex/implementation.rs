@@ -20,6 +20,18 @@ use super::{
 
 const MAX_INDEXED_TOOL_OUTPUT_CHARS: usize = 128 * 1024;
 
+thread_local! {
+    /// Tool outputs cut on this thread since the last `take_cut_tool_outputs`.
+    /// The source budget reads it after enrichment, so a source with cut text
+    /// is never certified complete.
+    static CUT_TOOL_OUTPUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many tool outputs were cut since the last call, resetting the count.
+fn take_cut_tool_outputs() -> usize {
+    CUT_TOOL_OUTPUTS.with(|cut| cut.replace(0))
+}
+
 pub struct CodexConnector {
     inner: franken_agent_detection::CodexConnector,
 }
@@ -622,6 +634,7 @@ fn truncate_tool_output(output: &str) -> String {
         truncated.push(ch);
     }
     let omitted = chars.count();
+    CUT_TOOL_OUTPUTS.with(|cut| cut.set(cut.get().saturating_add(1)));
     truncated.push_str(&format!(
         "\n[truncated {omitted} additional chars from tool output]"
     ));

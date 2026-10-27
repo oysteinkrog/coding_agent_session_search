@@ -74,6 +74,61 @@ fn oversized_legacy_rollouts_report_partial_coverage_without_hiding_healthy_sour
     Ok(())
 }
 
+#[test]
+fn a_rollout_with_cut_tool_output_is_delivered_but_never_certified() -> Result<()> {
+    let (_root, paths, ctx) = corpus("jsonl")?;
+    let output = serde_json::json!({
+        "type": "response_item",
+        "payload": {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "z".repeat(200_000),
+        },
+    });
+    fs::write(
+        &paths[1],
+        format!(
+            "{{\"type\":\"response_item\",\"payload\":{}}}\n{output}\n",
+            record("b")
+        ),
+    )?;
+    let mut delivered = Vec::new();
+    let mut completed = Vec::new();
+    let mut complete = |done: &SourceCompletion| {
+        completed.push(done.source.source_path.clone());
+        Ok(())
+    };
+    let mut hooks = SourceScanHooks {
+        should_scan_source: None,
+        on_source_complete: Some(&mut complete),
+        tail_resume: None,
+    };
+    let mut cut_text = None;
+    super::super::CodexConnector::new().scan_with_source_boundaries(
+        &ctx,
+        &mut hooks,
+        &mut |conversation| {
+            if conversation.source_path == paths[1] {
+                cut_text = conversation
+                    .messages
+                    .iter()
+                    .find(|message| message.content.contains("additional chars from tool output"))
+                    .map(|message| message.content.len());
+            }
+            delivered.push(conversation.source_path);
+            Ok(())
+        },
+    )?;
+    assert_eq!(delivered, paths, "every rollout is still delivered");
+    assert!(cut_text.is_some(), "the long tool output is indexed with a marker");
+    assert_eq!(
+        completed,
+        [paths[0].clone(), paths[2].clone()],
+        "the rollout with cut text is not certified complete"
+    );
+    Ok(())
+}
+
 /// Inject a real source rewrite after CASS admits it but before the real
 /// parser reads it. Do not mock normalization, discovery or completion logic.
 struct RewriteAfterAdmission {
