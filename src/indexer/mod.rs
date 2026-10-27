@@ -27571,6 +27571,24 @@ fn ingest_oom_retry_piece(
     Ok(())
 }
 
+/// The size of the largest message over 32 MiB in `conv`, counting a message
+/// split into chunks by its whole size.
+fn largest_message_over_long_line_bytes(conv: &NormalizedConversation) -> Option<u64> {
+    const LONG_LINE_BYTES: u64 = 32 * 1024 * 1024;
+    conv.messages
+        .iter()
+        .map(|message| {
+            message
+                .extra
+                .get(franken_agent_detection::MESSAGE_CHUNK_KEY)
+                .and_then(|record| record.get("total_bytes"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(message.content.len() as u64)
+        })
+        .filter(|bytes| *bytes > LONG_LINE_BYTES)
+        .max()
+}
+
 fn conversation_without_messages(conv: &NormalizedConversation) -> NormalizedConversation {
     NormalizedConversation {
         agent_slug: conv.agent_slug.clone(),
@@ -27731,6 +27749,19 @@ fn ingest_non_watch_oom_retry_or_quarantine(
     }
     // Rows the pieces stored before one ran out of memory are still counted.
     let stored = halves.canonical_mutations;
+    if let Some(message_bytes) = largest_message_over_long_line_bytes(conv) {
+        // Most likely a Codex line over 32 MiB, which is still read whole
+        // (no streaming yet). Kept apart from ordinary retries so the first
+        // real case is easy to find.
+        tracing::warn!(
+            agent = %conv.agent_slug,
+            external_id = conv.external_id.as_deref().unwrap_or(""),
+            source_path = %conv.source_path.display(),
+            message_bytes,
+            error = %error,
+            "a message over 32 MiB ran out of memory even on its own; setting its conversation aside"
+        );
+    }
 
     // #298: mirror the watch-path plausibility gate. frankensqlite raises the
     // same typed `FrankenError::OutOfMemory` for per-statement bounded
@@ -51905,6 +51936,24 @@ mod tests {
             "the deferred conversation is counted once"
         );
         Ok(())
+    }
+
+    #[test]
+    fn only_messages_over_32_mib_get_the_long_message_warning() {
+        let mut small = norm_msg(0, 1_700_000_000_000);
+        small.content = "x".repeat(1024);
+        let mut chunk = norm_msg(1, 1_700_000_000_001);
+        chunk.extra = serde_json::json!({
+            franken_agent_detection::MESSAGE_CHUNK_KEY: {"ordinal": 0, "total_bytes": 40_u64 << 20}
+        });
+        assert_eq!(
+            largest_message_over_long_line_bytes(&norm_conv(Some("a"), vec![small.clone()])),
+            None
+        );
+        assert_eq!(
+            largest_message_over_long_line_bytes(&norm_conv(Some("a"), vec![small, chunk])),
+            Some(40 << 20)
+        );
     }
 
     #[test]

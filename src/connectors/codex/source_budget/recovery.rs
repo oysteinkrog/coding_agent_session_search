@@ -286,6 +286,8 @@ pub(super) fn scan(
         exclusions: ScanExclusions::from_env(),
         limits,
     };
+    let long_lines_before =
+        franken_agent_detection::connectors::codex::codex_long_lines_held_whole();
     let sources = archives::discover(inner, ctx)?;
     let mut failures = Failures {
         budgets: limits.incomplete(),
@@ -318,6 +320,16 @@ pub(super) fn scan(
             }
             failures.record(&source, error);
         }
+    }
+    // Codex lines over 32 MiB do not stream yet. Each is indexed whole and
+    // logged by FAD; the count here lets the maintenance log show the first.
+    let long_lines = franken_agent_detection::connectors::codex::codex_long_lines_held_whole()
+        .saturating_sub(long_lines_before);
+    if long_lines > 0 {
+        tracing::warn!(
+            long_lines,
+            "codex scan read lines over 32 MiB whole; they are indexed, but held in memory"
+        );
     }
     failures.finish()
 }
