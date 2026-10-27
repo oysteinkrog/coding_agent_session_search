@@ -206,9 +206,9 @@ fn disappeared_inventory_source_is_not_a_successful_empty_scan() -> Result<()> {
 #[test]
 fn a_long_rollout_in_parts_keeps_one_idx_sequence_and_every_tool_call() -> Result<()> {
     let (_root, paths, ctx) = corpus()?;
-    // More turns than one part holds. Each has an answer (where a part may
-    // end) and a custom tool call that enrichment fills in, so every part is
-    // renumbered by it.
+    // More turns than one part holds. Each has a custom tool call that
+    // enrichment fills in, so every part is renumbered by it, then an answer,
+    // where a part may end.
     let prompts = 9_000;
     let mut body = String::new();
     for index in 0..prompts {
@@ -216,15 +216,15 @@ fn a_long_rollout_in_parts_keeps_one_idx_sequence_and_every_tool_call() -> Resul
         body.push_str(&format!(
             "{}\n",
             serde_json::json!({"type":"response_item","payload":{
-                "type":"message","role":"assistant",
-                "content":[{"type":"output_text","text":format!("answer-{index}")}]
+                "type":"custom_tool_call","name":"apply_patch",
+                "call_id":format!("call-{index}"),"input":format!("patch-{index}")
             }})
         ));
         body.push_str(&format!(
             "{}\n",
             serde_json::json!({"type":"response_item","payload":{
-                "type":"custom_tool_call","name":"apply_patch",
-                "call_id":format!("call-{index}"),"input":format!("patch-{index}")
+                "type":"message","role":"assistant",
+                "content":[{"type":"output_text","text":format!("answer-{index}")}]
             }})
         ));
     }
