@@ -343,13 +343,23 @@ fn augment_modern_codex_reader(
     }
 
     if added {
-        // A stable sort: the chunks of one message share its time and idx, so
-        // they stay together and in order.
-        conversation.messages.sort_by(|left, right| {
-            left.created_at
-                .cmp(&right.created_at)
-                .then_with(|| left.idx.cmp(&right.idx))
+        // Sort whole messages: a split message moves as one unit (chunk 0
+        // and the continuation chunks after it), so nothing lands between
+        // its chunks.
+        let mut units: Vec<Vec<NormalizedMessage>> = Vec::new();
+        for message in std::mem::take(&mut conversation.messages) {
+            match units.last_mut() {
+                Some(unit) if is_continuation_chunk(&message) => unit.push(message),
+                _ => units.push(vec![message]),
+            }
+        }
+        units.sort_by(|left, right| {
+            left[0]
+                .created_at
+                .cmp(&right[0].created_at)
+                .then_with(|| left[0].idx.cmp(&right[0].idx))
         });
+        conversation.messages = units.into_iter().flatten().collect();
         reindex_messages(&mut conversation.messages);
     }
     Ok(bytes_read)
@@ -663,6 +673,14 @@ fn is_chunk(message: &NormalizedMessage) -> bool {
         .is_some()
 }
 
+fn chunk_group(message: &NormalizedMessage) -> Option<&str> {
+    message
+        .extra
+        .get(franken_agent_detection::MESSAGE_CHUNK_KEY)
+        .and_then(|record| record.get("group"))
+        .and_then(Value::as_str)
+}
+
 fn is_continuation_chunk(message: &NormalizedMessage) -> bool {
     message
         .extra
@@ -690,9 +708,14 @@ fn whole_message_signature(
     if count <= 1 {
         return modern_codex_message_signature(message);
     }
+    let group = chunk_group(message);
     let mut hasher = blake3::Hasher::new();
     let end = index.saturating_add(count).min(messages.len());
     for chunk in &messages[index..end] {
+        // Only chunks of this message: anything else ends the text.
+        if chunk_group(chunk) != group {
+            break;
+        }
         hasher.update(chunk.content.as_bytes());
     }
     ModernCodexMessageSignature {
@@ -1137,6 +1160,44 @@ mod tests {
             before,
             "the whole-text candidate matches the split message; nothing is added"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_message_added_at_the_same_time_never_lands_between_chunks() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("rollout-same-time.jsonl");
+        let text = "w".repeat(franken_agent_detection::MESSAGE_CHUNK_BYTES + 10);
+        let long = response(serde_json::json!({
+            "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": text}]
+        }));
+        // Same timestamp as `long`; FAD did not store it, so the pass adds it.
+        let short = response(serde_json::json!({
+            "type": "function_call_output", "call_id": "c-9", "output": "late"
+        }));
+        std::fs::write(&path, format!("{long}\n{short}\n"))?;
+        let mut stored = modern_codex_message(&long).expect("message");
+        stored.extra = serde_json::json!({"compacted": true});
+        let mut conversation = conversation_at(&path);
+        conversation.messages = franken_agent_detection::chunk_message(stored);
+        reindex_messages(&mut conversation.messages);
+
+        augment_modern_codex_messages(&mut conversation, None)?;
+        assert_eq!(conversation.messages.len(), 3);
+        let chunk_zero = conversation
+            .messages
+            .iter()
+            .position(|message| chunk_group(message).is_some() && !is_continuation_chunk(message))
+            .unwrap();
+        assert!(is_continuation_chunk(
+            &conversation.messages[chunk_zero + 1]
+        ));
+
+        // A replay matches the split message by its whole text and adds nothing.
+        let before = serde_json::to_value(&conversation)?;
+        augment_modern_codex_messages(&mut conversation, None)?;
+        assert_eq!(serde_json::to_value(&conversation)?, before);
         Ok(())
     }
 
