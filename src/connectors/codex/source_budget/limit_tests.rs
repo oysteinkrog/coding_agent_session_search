@@ -35,41 +35,11 @@ fn tool_record() -> String {
 }
 
 #[test]
-fn policy_accepts_bounded_decimal_limits_and_keeps_legacy_ceiling() -> Result<()> {
-    assert_eq!(ScanLimits::default().jsonl_bytes, 104_857_600);
-    for value in ["1", " 536870912 \n", "1073741824"] {
-        let policy = ScanLimits::parse(value)?;
-        let expected = value.trim().parse::<u64>()?;
-        assert_eq!(policy.for_path(Path::new("rollout-test.jsonl")), expected);
-        for name in ["rollout-test.json", "rollout-test.JSONL", "rollout-test"] {
-            assert_eq!(policy.for_path(Path::new(name)), expected.min(104_857_600));
-        }
-    }
-    Ok(())
-}
-
-#[test]
-fn malformed_limits_never_become_unlimited_or_leak_the_setting() {
-    for value in [
-        "",
-        " ",
-        "0",
-        "-1",
-        "+1",
-        "1.5",
-        "NaN",
-        "512MiB",
-        "1_024",
-        "1073741825",
-        "18446744073709551616",
-        "秘密",
-        "\nprivate-value\n",
-    ] {
-        let error = ScanLimits::parse(value).unwrap_err().to_string();
-        assert!(error.contains(SOURCE_LIMIT_ENV));
-        if value.trim().len() > 12 {
-            assert!(!error.contains(value.trim()));
-        }
+fn jsonl_has_no_budget_and_legacy_json_keeps_its_ceiling() {
+    let policy = ScanLimits::default();
+    assert_eq!(policy.for_path(Path::new("rollout-test.jsonl")), u64::MAX);
+    for name in ["rollout-test.json", "rollout-test.JSONL", "rollout-test"] {
+        assert_eq!(policy.for_path(Path::new(name)), 104_857_600);
     }
 }
 
@@ -186,6 +156,28 @@ fn retained_handle_enrichment_reuses_tool_parser_and_rewinds_for_each_call() -> 
         );
     }
     assert_eq!(fs::read_to_string(&path)?, bytes);
+    Ok(())
+}
+
+#[test]
+fn retained_handle_enriches_a_part_from_its_own_byte_range() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("rollout-parts.jsonl");
+    let record = tool_record();
+    let second = record.replace("call-1", "call-2");
+    fs::write(&path, format!("{record}{second}"))?;
+    let snapshot = SourceSnapshot::capture_with_limit(&path, u64::MAX)?;
+    let start = record.len() as u64;
+    let mut output = conversation(&path);
+    output.metadata = serde_json::json!({
+        "part": {"ordinal": 1, "byte_start": start, "byte_end": start + second.len() as u64}
+    });
+    snapshot.enrich(&mut output, None)?;
+    assert_eq!(output.messages.len(), 1);
+    assert_eq!(
+        output.messages[0].invocations[0].call_id.as_deref(),
+        Some("call-2")
+    );
     Ok(())
 }
 

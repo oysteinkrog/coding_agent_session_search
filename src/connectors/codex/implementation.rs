@@ -7,7 +7,7 @@ pub(crate) use source_budget::over_budget_sources;
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read, Seek};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -139,19 +139,25 @@ fn augment_modern_codex_messages(
         )
         .into());
     }
-    if before.len() > MAX_AUGMENT_ROLLOUT_BYTES {
+    let (start, end) = enrichment_range(conversation, before.len())?;
+    if end - start > MAX_AUGMENT_ROLLOUT_BYTES {
         return Err(source_budget::EnrichmentBudgetExceeded {
-            observed_bytes: before.len(),
+            observed_bytes: end - start,
         }
         .into());
     }
 
-    // The first pass belongs to FAD; this pass owns only the opened prefix.
-    // Never follow appends indefinitely. Consumers receive the conversation
-    // only after enrichment and these observable-snapshot checks succeed.
-    let mut reader = BufReader::new((&file).take(before.len()));
+    // The first pass belongs to FAD; this pass owns only the opened prefix,
+    // or the byte range of this part of a long rollout. Never follow appends
+    // indefinitely. Consumers receive the conversation only after enrichment
+    // and these observable-snapshot checks succeed.
+    let mut file_at = &file;
+    file_at
+        .seek(io::SeekFrom::Start(start))
+        .context("seek Codex enrichment source")?;
+    let mut reader = BufReader::new(file_at.take(end - start));
     let bytes_read = augment_modern_codex_reader(conversation, progress_tick, &mut reader)?;
-    if bytes_read != before.len() {
+    if bytes_read != end - start {
         return Err(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "Codex enrichment source was truncated while reading; retry this source",
@@ -171,6 +177,25 @@ fn augment_modern_codex_messages(
         .into());
     }
     Ok(())
+}
+
+/// The bytes of the rollout this conversation came from: its part's range
+/// (`metadata.part`, set by FAD for a rollout handed out in parts), or the
+/// whole file of `len` bytes.
+fn enrichment_range(conversation: &NormalizedConversation, len: u64) -> Result<(u64, u64)> {
+    let Some(part) = conversation.metadata.get("part") else {
+        return Ok((0, len));
+    };
+    let start = part.get("byte_start").and_then(Value::as_u64);
+    let end = part.get("byte_end").and_then(Value::as_u64);
+    match (start, end) {
+        (Some(start), Some(end)) if start <= end && end <= len => Ok((start, end)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "Codex part range does not fit the rollout; retry this source",
+        )
+        .into()),
+    }
 }
 
 /// Detect observable rewrites/replacements, not malicious timestamp-preserving
@@ -1442,6 +1467,47 @@ mod tests {
         assert_eq!(retry.messages.len(), 2);
         assert!(retry.messages[1].content.contains("completed_tail"));
         assert_eq!(std::fs::read(&path)?, before_retry);
+        Ok(())
+    }
+
+    #[test]
+    fn a_part_is_enriched_from_its_own_byte_range_only() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("rollout-parts.jsonl");
+        let lines = [
+            custom_call("patch-1", "first_part").to_string(),
+            custom_call("patch-2", "second_part").to_string(),
+            custom_call("patch-3", "third_part").to_string(),
+        ];
+        std::fs::write(
+            &path,
+            lines
+                .iter()
+                .map(|line| format!("{line}\n"))
+                .collect::<String>(),
+        )?;
+        let start = lines[0].len() as u64 + 1;
+        let end = start + lines[1].len() as u64 + 1;
+
+        let mut conversation = conversation_at(&path);
+        conversation.metadata = serde_json::json!({
+            "part": {"ordinal": 1, "byte_start": start, "byte_end": end}
+        });
+        augment_modern_codex_messages(&mut conversation, None)?;
+        assert_eq!(conversation.messages.len(), 1);
+        assert!(conversation.messages[0].content.contains("second_part"));
+
+        // A range the file no longer holds is retried, never read short.
+        let mut stale = conversation_at(&path);
+        stale.metadata = serde_json::json!({
+            "part": {"ordinal": 1, "byte_start": start, "byte_end": end + 1_000_000}
+        });
+        let error = augment_modern_codex_messages(&mut stale, None).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert!(stale.messages.is_empty());
         Ok(())
     }
 

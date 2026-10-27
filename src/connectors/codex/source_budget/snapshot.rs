@@ -53,12 +53,14 @@ impl SourceSnapshot {
         progress_tick: Option<&(dyn Fn() + Send + Sync)>,
     ) -> Result<()> {
         self.validate(&conversation.source_path)?;
+        let (start, end) = super::super::enrichment_range(conversation, self.before.len())?;
         let mut file = &self.file;
-        file.rewind().context("rewind admitted Codex source")?;
-        let mut reader = BufReader::new(file.take(self.before.len()));
+        file.seek(io::SeekFrom::Start(start))
+            .context("seek admitted Codex source")?;
+        let mut reader = BufReader::new(file.take(end - start));
         let consumed =
             super::super::augment_modern_codex_reader(conversation, progress_tick, &mut reader)?;
-        if consumed != self.before.len() {
+        if consumed != end - start {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "admitted Codex source was truncated while enriching",

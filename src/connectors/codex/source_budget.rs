@@ -6,10 +6,10 @@
 //! entire scan. Any incomplete coverage returns an error, keeping watermarks
 //! conservative. Diagnostics are bounded and source files are never modified.
 //!
-//! GH #489: CASS_CODEX_MAX_SOURCE_BYTES explicitly raises the admission budget
-//! for modern .jsonl rollouts, up to 1 GiB (default 100 MiB). Legacy .json keeps
-//! the published parser's 100 MiB ceiling. This is a source-byte admission
-//! limit, not a process RSS limit or a deadline for the upstream primary scan.
+//! Modern .jsonl rollouts have no size budget: FAD hands a long rollout out in
+//! parts and each part is enriched from its own byte range, so memory stays
+//! bounded. (GH #489's `CASS_CODEX_MAX_SOURCE_BYTES` is no longer read.) Legacy
+//! .json keeps the published parser's 100 MiB ceiling.
 
 mod empty_source;
 mod recovery;
@@ -31,8 +31,8 @@ use super::{
 use snapshot::SourceSnapshot;
 
 const MAX_REJECTION_SAMPLES: usize = 32;
-const SOURCE_LIMIT_ENV: &str = "CASS_CODEX_MAX_SOURCE_BYTES";
-const MAX_CONFIGURED_SOURCE_BYTES: u64 = 1024 * 1024 * 1024;
+/// Read only to say that it is ignored.
+const RETIRED_SOURCE_LIMIT_ENV: &str = "CASS_CODEX_MAX_SOURCE_BYTES";
 
 /// One immutable policy for discovery, every source attempt and both passes.
 #[derive(Debug, Clone, Copy)]
@@ -43,37 +43,19 @@ struct ScanLimits {
 impl Default for ScanLimits {
     fn default() -> Self {
         Self {
-            jsonl_bytes: MAX_AUGMENT_ROLLOUT_BYTES,
+            jsonl_bytes: u64::MAX,
         }
     }
 }
 
 impl ScanLimits {
-    fn invalid() -> anyhow::Error {
-        anyhow::anyhow!(
-            "{SOURCE_LIMIT_ENV} must be a decimal byte count from 1 through {MAX_CONFIGURED_SOURCE_BYTES}; unset it for the 100 MiB default"
-        )
-    }
-
-    fn parse(value: &str) -> Result<Self> {
-        let value = value.trim();
-        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(Self::invalid());
-        }
-        let jsonl_bytes = value.parse::<u64>().map_err(|_| Self::invalid())?;
-        if !(1..=MAX_CONFIGURED_SOURCE_BYTES).contains(&jsonl_bytes) {
-            return Err(Self::invalid());
-        }
-        Ok(Self { jsonl_bytes })
-    }
-
     fn from_env() -> Result<Self> {
-        match dotenvy::var(SOURCE_LIMIT_ENV) {
-            Ok(value) => Self::parse(&value),
-            Err(dotenvy::Error::EnvVar(std::env::VarError::NotPresent)) => Ok(Self::default()),
-            // Do not echo malformed configuration or treat non-Unicode as unset.
-            Err(_) => Err(Self::invalid()),
+        if dotenvy::var(RETIRED_SOURCE_LIMIT_ENV).is_ok() {
+            tracing::warn!(
+                "{RETIRED_SOURCE_LIMIT_ENV} is ignored: Codex rollouts of any size are indexed"
+            );
         }
+        Ok(Self::default())
     }
 
     fn for_path(self, path: &Path) -> u64 {
@@ -201,6 +183,9 @@ struct ScanState {
     preflight_error: Option<anyhow::Error>,
     withheld_source: Option<PathBuf>,
     delivered_conversation: bool,
+    /// The idx the next part of a long rollout starts at. Enrichment numbers
+    /// each part from 0, so parts are renumbered here to stay one sequence.
+    next_part_idx: i64,
     incomplete: IncompleteScan,
 }
 
@@ -356,7 +341,11 @@ fn scan_with_admission(
         {
             return false;
         }
-        state.borrow_mut().current_source = Some(source.source_path.clone());
+        {
+            let mut state = state.borrow_mut();
+            state.current_source = Some(source.source_path.clone());
+            state.next_part_idx = 0;
+        }
         let limit = admission.limits.for_path(&source.source_path);
         if let Some(size) = observed_over_limit_with_limit(source, limit) {
             state.borrow_mut().reject(&source.source_path, size);
@@ -440,6 +429,13 @@ fn scan_with_admission(
         state
             .borrow()
             .validate_current_source(&conversation.source_path)?;
+        if conversation.metadata.get("part").is_some() {
+            let mut state = state.borrow_mut();
+            for message in &mut conversation.messages {
+                message.idx = state.next_part_idx;
+                state.next_part_idx += 1;
+            }
+        }
         // Deliberately outside the enrichment error match: sink/storage errors
         // must abort even when a caller returns the same concrete error type.
         let source_path = conversation.source_path.clone();

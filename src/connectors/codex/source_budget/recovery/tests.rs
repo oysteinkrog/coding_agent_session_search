@@ -103,7 +103,9 @@ fn invalid_data_and_budget_failures_are_both_reported() -> Result<()> {
     let mut invalid = message("private-data").into_bytes();
     invalid.extend_from_slice(b"\xff\n");
     fs::write(&paths[0], &invalid)?;
-    fs::File::create(&paths[1])?.set_len(super::super::MAX_AUGMENT_ROLLOUT_BYTES + 1)?;
+    // Only legacy .json keeps a read budget; .jsonl rollouts have none.
+    let legacy = paths[2].with_file_name("rollout-d.json");
+    fs::File::create(&legacy)?.set_len(super::super::MAX_AUGMENT_ROLLOUT_BYTES + 1)?;
     let mut delivered = Vec::new();
     let error = CodexConnector::new()
         .scan_with_callback(&ctx, &mut |conversation| {
@@ -111,7 +113,7 @@ fn invalid_data_and_budget_failures_are_both_reported() -> Result<()> {
             Ok(())
         })
         .unwrap_err();
-    assert_eq!(delivered, [paths[2].clone()]);
+    assert_eq!(delivered, [paths[1].clone(), paths[2].clone()]);
     let report = error.downcast_ref::<FailureReport>().unwrap();
     assert_eq!(report.failed_source_count, 2);
     assert_eq!(report.failed_sources[0].reason, "invalid_source_data");
@@ -198,5 +200,50 @@ fn disappeared_inventory_source_is_not_a_successful_empty_scan() -> Result<()> {
             .failed_source_count,
         1
     );
+    Ok(())
+}
+
+#[test]
+fn a_long_rollout_in_parts_keeps_one_idx_sequence_and_every_tool_call() -> Result<()> {
+    let (_root, paths, ctx) = corpus()?;
+    // More user prompts than one part holds, each followed by a custom tool
+    // call that only enrichment adds, so every part is renumbered by it.
+    let prompts = 9_000;
+    let mut body = String::new();
+    for index in 0..prompts {
+        body.push_str(&message(&format!("prompt-{index}")));
+        body.push_str(&format!(
+            "{}\n",
+            serde_json::json!({"type":"response_item","payload":{
+                "type":"custom_tool_call","name":"apply_patch",
+                "call_id":format!("call-{index}"),"input":format!("patch-{index}")
+            }})
+        ));
+    }
+    fs::write(&paths[1], &body)?;
+    let mut parts = Vec::new();
+    CodexConnector::new().scan_with_callback(&ctx, &mut |conversation| {
+        if conversation.source_path == paths[1] {
+            parts.push(conversation);
+        }
+        Ok(())
+    })?;
+    assert!(parts.len() >= 2, "{} parts", parts.len());
+    let mut next_idx = 0;
+    let mut next_byte = 0;
+    let mut patches = 0;
+    for part in &parts {
+        let range = &part.metadata["part"];
+        assert_eq!(range["byte_start"].as_u64(), Some(next_byte));
+        next_byte = range["byte_end"].as_u64().unwrap();
+        for message in &part.messages {
+            assert_eq!(message.idx, next_idx);
+            next_idx += 1;
+            patches += usize::from(message.content.contains("patch-"));
+        }
+    }
+    assert_eq!(next_byte, body.len() as u64);
+    assert_eq!(next_idx, 2 * prompts as i64);
+    assert_eq!(patches, prompts);
     Ok(())
 }

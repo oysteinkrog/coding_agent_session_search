@@ -286,8 +286,8 @@ fn classify_kind(
             SourceIngestDisposition::Skipped,
             format!(
                 "{provider} session file is larger than the per-source read budget and was not \
-                 indexed; raise the budget (Codex: CASS_CODEX_MAX_SOURCE_BYTES, up to 1073741824 \
-                 bytes), then re-index"
+                 indexed; report it, since sources of this kind should have no size budget, then \
+                 re-index"
             ),
         ),
     }
@@ -1345,11 +1345,7 @@ mod tests {
             IngestFailureKind::SourceOverReadBudget
         );
         verify_eq!(diagnostic.source_path, "/codex/sessions/rollout-big.jsonl");
-        verify!(
-            diagnostic
-                .safe_next_action
-                .contains("CASS_CODEX_MAX_SOURCE_BYTES")
-        );
+        verify!(diagnostic.safe_next_action.contains("no size budget"));
         verify_eq!(report.summary.skipped, 1);
 
         let mut run = ConnectorIngestRun::begin("codex", Path::new("/data"), &ctx, &[]);
