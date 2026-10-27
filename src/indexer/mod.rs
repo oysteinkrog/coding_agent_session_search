@@ -27466,6 +27466,41 @@ fn ingest_non_watch_batch_once(
     Ok(outcome)
 }
 
+/// Where to split a conversation that ran out of memory on its own: about
+/// half way, never inside a message split into chunks. `None` when it cannot
+/// be split, or has no external id that would join the halves again.
+fn oom_retry_split_point(conv: &NormalizedConversation) -> Option<usize> {
+    if conv.external_id.is_none() || conv.messages.len() < 2 {
+        return None;
+    }
+    let continues_chunk = |message: &NormalizedMessage| {
+        message
+            .extra
+            .get(franken_agent_detection::MESSAGE_CHUNK_KEY)
+            .and_then(|record| record.get("ordinal"))
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|ordinal| ordinal > 0)
+    };
+    let half = conv.messages.len() / 2;
+    (half..conv.messages.len())
+        .chain((1..half).rev())
+        .find(|&index| !continues_chunk(&conv.messages[index]))
+}
+
+fn conversation_without_messages(conv: &NormalizedConversation) -> NormalizedConversation {
+    NormalizedConversation {
+        agent_slug: conv.agent_slug.clone(),
+        external_id: conv.external_id.clone(),
+        title: conv.title.clone(),
+        workspace: conv.workspace.clone(),
+        source_path: conv.source_path.clone(),
+        started_at: conv.started_at,
+        ended_at: conv.ended_at,
+        metadata: conv.metadata.clone(),
+        messages: Vec::new(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn ingest_non_watch_oom_retry_or_quarantine(
     storage: &FrankenStorage,
@@ -27548,6 +27583,46 @@ fn ingest_non_watch_oom_retry_or_quarantine(
     }
 
     let conv = &convs[0];
+
+    // One conversation too big to ingest at once goes in as two halves, as
+    // a long session's parts do: storage appends the second half to the
+    // first. Each half splits again on OOM, so only one message (or one
+    // split message, kept whole) that still runs out of memory is deferred.
+    if let Some(split_at) = oom_retry_split_point(conv) {
+        tracing::warn!(
+            agent = %conv.agent_slug,
+            external_id = conv.external_id.as_deref().unwrap_or(""),
+            source_path = %conv.source_path.display(),
+            messages = conv.messages.len(),
+            split_at,
+            error = %error,
+            "single non-watch conversation ran out of memory; retrying it as two halves"
+        );
+        let mut outcome = NonWatchIngestOutcome::default();
+        for range in [0..split_at, split_at..conv.messages.len()] {
+            // Clone one half at a time, so the retry holds at most one copy.
+            let half = NormalizedConversation {
+                messages: conv.messages[range].to_vec(),
+                ..conversation_without_messages(conv)
+            };
+            outcome = outcome.accumulate(ingest_non_watch_batch_with_oom_split(
+                storage,
+                None,
+                data_dir,
+                std::slice::from_ref(&half),
+                progress,
+                LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+                defer_checkpoints,
+                progress_bump,
+            )?);
+        }
+        // The two halves counted as two conversations; this is one.
+        if let Some(progress) = progress {
+            progress.current.fetch_sub(1, Ordering::Relaxed);
+        }
+        outcome.lexical_update_deferred = true;
+        return Ok(outcome);
+    }
 
     // #298: mirror the watch-path plausibility gate. frankensqlite raises the
     // same typed `FrankenError::OutOfMemory` for per-statement bounded
@@ -29647,6 +29722,8 @@ fn should_force_watch_solo_retry_oom() -> bool {
 std::thread_local! {
     static NON_WATCH_INGEST_TEST_OOM_MIN_CONVS: std::cell::Cell<Option<usize>> =
         const { std::cell::Cell::new(None) };
+    static NON_WATCH_INGEST_TEST_OOM_MIN_MESSAGES: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
     static INCREMENTAL_LEXICAL_UPDATE_TEST_OOM: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
@@ -29656,6 +29733,9 @@ fn should_inject_non_watch_ingest_test_oom(convs: &[NormalizedConversation]) -> 
     NON_WATCH_INGEST_TEST_OOM_MIN_CONVS
         .with(std::cell::Cell::get)
         .is_some_and(|min| min > 0 && convs.len() >= min)
+        || NON_WATCH_INGEST_TEST_OOM_MIN_MESSAGES
+            .with(std::cell::Cell::get)
+            .is_some_and(|min| convs.iter().any(|conv| conv.messages.len() >= min))
 }
 
 #[cfg(not(test))]
@@ -51626,6 +51706,91 @@ mod tests {
             "storage should contain every chunked conversation"
         );
         Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn a_conversation_that_runs_out_of_memory_goes_in_as_halves() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir)?;
+        let storage = FrankenStorage::open(&data_dir.join("db.sqlite"))?;
+        ensure_fts_schema(&storage);
+        let progress_tracker = Arc::new(IndexingProgress::default());
+        let progress = Some(progress_tracker.clone());
+        let conversation = norm_conv(
+            Some("oom-halves"),
+            (0..8)
+                .map(|idx| norm_msg(idx, 1_700_000_000_000 + idx))
+                .collect(),
+        );
+        // Any batch holding a conversation of 3 or more messages runs out of
+        // memory, so the 8 messages go in as 4 pieces of 2.
+        let previous = NON_WATCH_INGEST_TEST_OOM_MIN_MESSAGES.with(|cell| cell.replace(Some(3)));
+        let outcome = ingest_non_watch_batch_with_oom_split(
+            &storage,
+            None,
+            &data_dir,
+            std::slice::from_ref(&conversation),
+            &progress,
+            LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
+            true,
+            None,
+        );
+        NON_WATCH_INGEST_TEST_OOM_MIN_MESSAGES.with(|cell| cell.set(previous));
+        let outcome = outcome?;
+
+        anyhow::ensure!(
+            outcome.quarantined_conversations == 0,
+            "nothing quarantined"
+        );
+        anyhow::ensure!(outcome.deferred_sources.is_empty(), "nothing deferred");
+        anyhow::ensure!(outcome.inserted_messages == 8, "every message stored");
+        anyhow::ensure!(
+            progress_tracker.current.load(Ordering::Relaxed) == 1,
+            "one conversation counted once"
+        );
+        let rows: Vec<(i64, String)> = storage.raw().query_map_collect(
+            "SELECT idx, content FROM messages ORDER BY idx",
+            &[] as &[ParamValue],
+            |row: &crate::franken_sync::Row| {
+                Ok((row.get_typed::<i64>(0)?, row.get_typed::<String>(1)?))
+            },
+        )?;
+        let expected: Vec<(i64, String)> = (0..8).map(|idx| (idx, format!("msg-{idx}"))).collect();
+        anyhow::ensure!(rows == expected, "one conversation in order: {rows:?}");
+        let conversations: i64 =
+            storage
+                .raw()
+                .query_row_map("SELECT COUNT(*) FROM conversations", &[], |row| {
+                    row.get_typed(0)
+                })?;
+        anyhow::ensure!(conversations == 1, "the halves join into one conversation");
+        Ok(())
+    }
+
+    #[test]
+    fn an_oom_split_never_falls_inside_a_split_message() {
+        let chunk = |idx: i64, ordinal: u64| {
+            let mut message = norm_msg(idx, 1_700_000_000_000 + idx);
+            message.extra = serde_json::json!({
+                franken_agent_detection::MESSAGE_CHUNK_KEY: {"group": "g", "ordinal": ordinal}
+            });
+            message
+        };
+        let messages = vec![
+            norm_msg(0, 1_700_000_000_000),
+            chunk(1, 0),
+            chunk(2, 1),
+            chunk(3, 2),
+            chunk(4, 3),
+            norm_msg(5, 1_700_000_000_005),
+        ];
+        let conversation = norm_conv(Some("chunks"), messages.clone());
+        assert_eq!(oom_retry_split_point(&conversation), Some(5));
+        let only_chunks = norm_conv(Some("chunks"), messages[1..5].to_vec());
+        assert_eq!(oom_retry_split_point(&only_chunks), None);
+        assert_eq!(oom_retry_split_point(&norm_conv(None, messages)), None);
     }
 
     #[test]
