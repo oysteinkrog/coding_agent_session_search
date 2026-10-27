@@ -4925,11 +4925,33 @@ fn with_lexical_overlap(message: &mut Message, tail: Option<&String>) {
 
 /// One lexical-rebuild projection row (`id, idx, role, author, created_at,
 /// content, source byte length`) as a [`Message`], with its whole text.
+/// An unsplit row longer than this is loaded whole but logged and counted:
+/// rows stored before messages were split can be this long (step 6).
+const LEXICAL_LONG_ROW_BYTES: usize = 32 * 1024 * 1024;
+
+static LEXICAL_LONG_ROWS_LOADED: AtomicU64 = AtomicU64::new(0);
+
+/// How many rows over 32 MiB the lexical readers have loaded whole in this
+/// process.
+pub fn lexical_long_rows_loaded() -> u64 {
+    LEXICAL_LONG_ROWS_LOADED.load(Ordering::Relaxed)
+}
+
 fn lexical_rebuild_message_from_row(
     row: &FrankenRow,
 ) -> std::result::Result<Message, crate::franken_sync::FrankenError> {
     let role: String = row.get_typed(2)?;
     let content: String = row.get_typed(5)?;
+    if content.len() > LEXICAL_LONG_ROW_BYTES {
+        // Chunk rows are at most 4 MiB, so this row was stored unsplit.
+        let count = LEXICAL_LONG_ROWS_LOADED.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::warn!(
+            message_id = row.get_typed::<i64>(0).ok(),
+            bytes = content.len(),
+            count,
+            "lexical index loads an unsplit message over 32 MiB whole"
+        );
+    }
     Ok(Message {
         id: Some(row.get_typed(0)?),
         idx: row.get_typed(1)?,
