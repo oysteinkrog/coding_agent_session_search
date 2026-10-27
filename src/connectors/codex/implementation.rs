@@ -634,6 +634,9 @@ fn truncate_tool_output(output: &str) -> String {
         truncated.push(ch);
     }
     let omitted = chars.count();
+    if omitted == 0 {
+        return output.to_string();
+    }
     CUT_TOOL_OUTPUTS.with(|cut| cut.set(cut.get().saturating_add(1)));
     truncated.push_str(&format!(
         "\n[truncated {omitted} additional chars from tool output]"
@@ -799,6 +802,19 @@ fn tool_call_content_has_name(content: &str, tool_name: &str) -> bool {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn a_tool_output_at_the_limit_is_kept_whole_and_not_counted_as_cut() {
+        take_cut_tool_outputs();
+        let exact = "a".repeat(MAX_INDEXED_TOOL_OUTPUT_CHARS);
+        assert_eq!(truncate_tool_output(&exact), exact);
+        assert_eq!(take_cut_tool_outputs(), 0);
+        let over = "a".repeat(MAX_INDEXED_TOOL_OUTPUT_CHARS + 1);
+        assert!(
+            truncate_tool_output(&over).ends_with("[truncated 1 additional chars from tool output]")
+        );
+        assert_eq!(take_cut_tool_outputs(), 1);
+    }
 
     fn message(content: &str, call_id: Option<&str>) -> NormalizedMessage {
         NormalizedMessage {
