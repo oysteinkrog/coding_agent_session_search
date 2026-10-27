@@ -206,12 +206,20 @@ fn disappeared_inventory_source_is_not_a_successful_empty_scan() -> Result<()> {
 #[test]
 fn a_long_rollout_in_parts_keeps_one_idx_sequence_and_every_tool_call() -> Result<()> {
     let (_root, paths, ctx) = corpus()?;
-    // More user prompts than one part holds, each followed by a custom tool
-    // call that only enrichment adds, so every part is renumbered by it.
+    // More turns than one part holds. Each has an answer (where a part may
+    // end) and a custom tool call that enrichment fills in, so every part is
+    // renumbered by it.
     let prompts = 9_000;
     let mut body = String::new();
     for index in 0..prompts {
         body.push_str(&message(&format!("prompt-{index}")));
+        body.push_str(&format!(
+            "{}\n",
+            serde_json::json!({"type":"response_item","payload":{
+                "type":"message","role":"assistant",
+                "content":[{"type":"output_text","text":format!("answer-{index}")}]
+            }})
+        ));
         body.push_str(&format!(
             "{}\n",
             serde_json::json!({"type":"response_item","payload":{
@@ -243,7 +251,7 @@ fn a_long_rollout_in_parts_keeps_one_idx_sequence_and_every_tool_call() -> Resul
         }
     }
     assert_eq!(next_byte, body.len() as u64);
-    assert_eq!(next_idx, 2 * prompts as i64);
+    assert_eq!(next_idx, 3 * prompts as i64);
     assert_eq!(patches, prompts);
     Ok(())
 }
