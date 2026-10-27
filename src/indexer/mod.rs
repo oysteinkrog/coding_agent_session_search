@@ -27438,16 +27438,7 @@ fn ingest_non_watch_batch_once(
     defer_checkpoints: bool,
     progress_bump: Option<&Arc<AtomicI64>>,
 ) -> Result<NonWatchIngestOutcome> {
-    if should_inject_non_watch_ingest_test_oom(convs) {
-        // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
-        // exercises the downcast path that real frankensqlite OOMs hit, instead
-        // of relying on the plain-string fallback.
-        return Err(anyhow::Error::new(
-            crate::franken_sync::FrankenError::OutOfMemory,
-        ));
-    }
-
-    let outcome = ingest_batch_detailed(
+    let outcome = ingest_non_watch_batch_keeping_quarantine(
         storage,
         t_index,
         data_dir,
@@ -27464,6 +27455,40 @@ fn ingest_non_watch_batch_once(
         convs,
     );
     Ok(outcome)
+}
+
+/// [`ingest_non_watch_batch_once`] without clearing quarantine records, for
+/// pieces of a conversation whose records are keyed by the whole of it.
+#[allow(clippy::too_many_arguments)]
+fn ingest_non_watch_batch_keeping_quarantine(
+    storage: &FrankenStorage,
+    t_index: Option<&mut TantivyIndex>,
+    data_dir: &Path,
+    convs: &[NormalizedConversation],
+    progress: &Option<Arc<IndexingProgress>>,
+    lexical_strategy: LexicalPopulationStrategy,
+    defer_checkpoints: bool,
+    progress_bump: Option<&Arc<AtomicI64>>,
+) -> Result<NonWatchIngestOutcome> {
+    if should_inject_non_watch_ingest_test_oom(convs) {
+        // Use the typed `FrankenError::OutOfMemory` variant so the OOM detector
+        // exercises the downcast path that real frankensqlite OOMs hit, instead
+        // of relying on the plain-string fallback.
+        return Err(anyhow::Error::new(
+            crate::franken_sync::FrankenError::OutOfMemory,
+        ));
+    }
+
+    ingest_batch_detailed(
+        storage,
+        t_index,
+        data_dir,
+        convs,
+        progress,
+        lexical_strategy,
+        defer_checkpoints,
+        progress_bump,
+    )
 }
 
 /// Where to split a conversation that ran out of memory on its own: about
@@ -27488,28 +27513,40 @@ fn oom_retry_split_point(conv: &NormalizedConversation) -> Option<usize> {
 }
 
 /// Ingest one piece of a conversation that ran out of memory, as two smaller
-/// pieces if it runs out again. Returns the OOM of a piece that cannot be
-/// split. Pieces are not counted in progress nor recorded in quarantine:
-/// the caller does both for the whole conversation.
+/// pieces if it runs out again, adding what was stored to `stored`. Returns
+/// the OOM of a piece that cannot be split. Pieces neither count in progress
+/// nor touch quarantine records: the caller does both for the whole
+/// conversation.
 fn ingest_oom_retry_piece(
     storage: &FrankenStorage,
     data_dir: &Path,
     piece: NormalizedConversation,
+    progress: &Option<Arc<IndexingProgress>>,
     defer_checkpoints: bool,
     progress_bump: Option<&Arc<AtomicI64>>,
-) -> Result<NonWatchIngestOutcome> {
-    let error = match ingest_non_watch_batch_once(
+    stored: &mut NonWatchIngestOutcome,
+) -> Result<()> {
+    // Progress goes in for its activity heartbeats; the piece's own count
+    // is taken back out below.
+    let error = match ingest_non_watch_batch_keeping_quarantine(
         storage,
         None,
         data_dir,
         std::slice::from_ref(&piece),
-        &None,
+        progress,
         LexicalPopulationStrategy::DeferredAuthoritativeDbRebuild,
         defer_checkpoints,
         progress_bump,
     ) {
+        Ok(outcome) => {
+            if let Some(progress) = progress {
+                progress.current.fetch_sub(1, Ordering::Relaxed);
+            }
+            *stored = std::mem::take(stored).accumulate(outcome);
+            return Ok(());
+        }
         Err(error) if error_is_out_of_memory(&error) => error,
-        other => return other,
+        Err(error) => return Err(error),
     };
     let Some(split_at) = oom_retry_split_point(&piece) else {
         return Err(error);
@@ -27517,26 +27554,21 @@ fn ingest_oom_retry_piece(
     let base = conversation_without_messages(&piece);
     let mut left = piece.messages;
     let right = left.split_off(split_at);
-    let outcome = ingest_oom_retry_piece(
-        storage,
-        data_dir,
-        NormalizedConversation {
-            messages: left,
-            ..base.clone()
-        },
-        defer_checkpoints,
-        progress_bump,
-    )?;
-    Ok(outcome.accumulate(ingest_oom_retry_piece(
-        storage,
-        data_dir,
-        NormalizedConversation {
-            messages: right,
-            ..base
-        },
-        defer_checkpoints,
-        progress_bump,
-    )?))
+    for messages in [left, right] {
+        ingest_oom_retry_piece(
+            storage,
+            data_dir,
+            NormalizedConversation {
+                messages,
+                ..base.clone()
+            },
+            progress,
+            defer_checkpoints,
+            progress_bump,
+            stored,
+        )?;
+    }
+    Ok(())
 }
 
 fn conversation_without_messages(conv: &NormalizedConversation) -> NormalizedConversation {
@@ -27635,6 +27667,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
     }
 
     let conv = &convs[0];
+    let mut halves = NonWatchIngestOutcome::default();
 
     // One conversation too big to ingest at once goes in as two halves, as
     // a long session's parts do: storage appends the second half to the
@@ -27654,7 +27687,6 @@ fn ingest_non_watch_oom_retry_or_quarantine(
             "single non-watch conversation ran out of memory; retrying it as two halves"
         );
         let base = conversation_without_messages(conv);
-        let mut halves = NonWatchIngestOutcome::default();
         let mut piece_error = None;
         for range in [0..split_at, split_at..conv.messages.len()] {
             // Clone one half at a time, so the retry holds at most one copy.
@@ -27662,9 +27694,16 @@ fn ingest_non_watch_oom_retry_or_quarantine(
                 messages: conv.messages[range].to_vec(),
                 ..base.clone()
             };
-            match ingest_oom_retry_piece(storage, data_dir, half, defer_checkpoints, progress_bump)
-            {
-                Ok(outcome) => halves = halves.accumulate(outcome),
+            match ingest_oom_retry_piece(
+                storage,
+                data_dir,
+                half,
+                progress,
+                defer_checkpoints,
+                progress_bump,
+                &mut halves,
+            ) {
+                Ok(()) => {}
                 Err(piece) if error_is_out_of_memory(&piece) => {
                     piece_error = Some(piece);
                     break;
@@ -27690,6 +27729,8 @@ fn ingest_non_watch_oom_retry_or_quarantine(
             Some(piece) => error = piece,
         }
     }
+    // Rows the pieces stored before one ran out of memory are still counted.
+    let stored = halves.canonical_mutations;
 
     // #298: mirror the watch-path plausibility gate. frankensqlite raises the
     // same typed `FrankenError::OutOfMemory` for per-statement bounded
@@ -27721,7 +27762,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
         }
         bump_index_run_lock_progress_if_present(progress_bump);
         return Ok(NonWatchIngestOutcome {
-            canonical_mutations: CanonicalMutationCounts::default(),
+            canonical_mutations: stored,
             quarantined_conversations: 0,
             lexical_update_deferred: true,
             scanned_connectors: BTreeSet::new(),
@@ -27753,7 +27794,7 @@ fn ingest_non_watch_oom_retry_or_quarantine(
         "single non-watch conversation ran out of memory after deferred lexical retry; quarantined and continuing index refresh"
     );
     Ok(NonWatchIngestOutcome {
-        canonical_mutations: CanonicalMutationCounts::default(),
+        canonical_mutations: stored,
         quarantined_conversations: 1,
         lexical_update_deferred: true,
         scanned_connectors: BTreeSet::new(),
