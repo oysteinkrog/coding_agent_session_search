@@ -37071,6 +37071,197 @@ pub mod persist {
             assert_eq!(hits("tailmark"), 1, "a long message is indexed whole");
         }
 
+        /// Step 6: a phrase across a chunk cut matches through the overlap
+        /// when chunk 1 arrives in a later part (incremental path), and the
+        /// same after a full rebuild. A split message gives one hit.
+        #[test]
+        #[serial]
+        fn a_phrase_across_a_chunk_cut_matches_once_on_every_lexical_path() {
+            use crate::search::query::{FieldMask, SearchClient, SearchFilters};
+            use franken_agent_detection::{MESSAGE_CHUNK_BYTES, MESSAGE_CHUNK_KEY};
+
+            let _defer = set_env("CASS_DEFER_LEXICAL_UPDATES", "0");
+            let _begin = set_env("CASS_INDEXER_BEGIN_CONCURRENT", "0");
+            let dir = tempfile::TempDir::new().unwrap();
+            let db_path = dir.path().join("agent_search.db");
+            let storage = create_franken_db(&db_path);
+            let index_path = crate::search::tantivy::index_dir(dir.path()).unwrap();
+            let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
+
+            // Chunk 0 is a full chunk that ends inside the phrase.
+            let head = " crossingalpha";
+            let filler = "loremword ";
+            let mut first = filler.repeat((MESSAGE_CHUNK_BYTES - head.len()) / filler.len());
+            first.push_str(&" ".repeat(MESSAGE_CHUNK_BYTES - head.len() - first.len()));
+            first.push_str(head);
+            assert_eq!(first.len(), MESSAGE_CHUNK_BYTES);
+            let second = " crossingbeta and the end".to_string();
+            let total = first.len() + second.len();
+            let message = |idx: i64, role: &str, content: String, extra: serde_json::Value| {
+                NormalizedMessage {
+                    idx,
+                    role: role.into(),
+                    author: None,
+                    created_at: Some(1_700_000_000_000 + idx),
+                    content,
+                    extra,
+                    snippets: Vec::new(),
+                    invocations: Vec::new(),
+                }
+            };
+            let chunk = |ordinal: u64, start: usize, end: usize| {
+                serde_json::json!({
+                    "uuid": format!("split-{ordinal}"),
+                    MESSAGE_CHUNK_KEY: {
+                        "group": "split-group", "ordinal": ordinal, "count": 2,
+                        "byte_start": start, "byte_end": end, "total_bytes": total,
+                    }
+                })
+            };
+            let mut conv = NormalizedConversation {
+                agent_slug: "claude_code".into(),
+                external_id: Some("split-message".into()),
+                title: Some("Split message".into()),
+                workspace: Some(dir.path().join("workspace")),
+                source_path: dir.path().join("source.jsonl"),
+                started_at: Some(1_700_000_000_000),
+                ended_at: Some(1_700_000_000_001),
+                metadata: serde_json::Value::Null,
+                messages: vec![
+                    message(
+                        0,
+                        "user",
+                        "a question".into(),
+                        serde_json::json!({"uuid": "q"}),
+                    ),
+                    message(1, "assistant", first.clone(), chunk(0, 0, first.len())),
+                ],
+            };
+            persist_conversation(&storage, &mut index, &conv).unwrap();
+            // The second part brings chunk 1 and a reply.
+            conv.messages.push(message(
+                2,
+                "assistant",
+                second.clone(),
+                chunk(1, first.len(), total),
+            ));
+            conv.messages.push(message(
+                3,
+                "user",
+                "loremword in a reply".into(),
+                serde_json::json!({"uuid": "r"}),
+            ));
+            conv.ended_at = Some(1_700_000_000_003);
+            persist_conversation(&storage, &mut index, &conv).unwrap();
+            assert_eq!(tantivy_doc_count(&mut index), 4);
+            drop(index);
+
+            let observe = |label: &str| {
+                let client = SearchClient::open(&index_path, Some(&db_path))
+                    .unwrap()
+                    .unwrap();
+                let search = |query: &str| {
+                    client
+                        .search(query, SearchFilters::default(), 10, 0, FieldMask::FULL)
+                        .unwrap()
+                };
+                let phrase = search("\"crossingalpha crossingbeta\"");
+                assert_eq!(
+                    phrase.len(),
+                    1,
+                    "{label}: the phrase across the cut matches once"
+                );
+                assert_eq!(phrase[0].line_number, Some(3), "{label}: in chunk 1");
+                assert_eq!(
+                    phrase[0].content, second,
+                    "{label}: content is the chunk itself"
+                );
+                assert!(
+                    phrase[0].snippet.contains("crossingalpha")
+                        && phrase[0].snippet.contains("crossingbeta"),
+                    "{label}: the snippet shows the phrase: {}",
+                    phrase[0].snippet
+                );
+                let filler_hits = search("loremword");
+                let mut lines: Vec<_> = filler_hits.iter().map(|hit| hit.line_number).collect();
+                lines.sort_unstable();
+                assert_eq!(lines.len(), 2, "{label}: one hit per message: {lines:?}");
+                assert!(lines.contains(&Some(4)), "{label}: the reply: {lines:?}");
+                assert!(
+                    lines.contains(&Some(2)) || lines.contains(&Some(3)),
+                    "{label}: one chunk of the split message: {lines:?}"
+                );
+                let beta = search("crossingbeta");
+                assert_eq!(beta.len(), 1, "{label}");
+                assert_eq!(beta[0].line_number, Some(3), "{label}");
+                (
+                    phrase
+                        .iter()
+                        .map(|hit| (hit.line_number, hit.snippet.clone()))
+                        .collect::<Vec<_>>(),
+                    lines,
+                )
+            };
+            let incremental = observe("incremental");
+            let rebuilt =
+                crate::indexer::rebuild_tantivy_from_db(&db_path, dir.path(), 1, None).unwrap();
+            assert_eq!(rebuilt.indexed_docs, 4);
+            assert_eq!(
+                observe("rebuild"),
+                incremental,
+                "incremental and rebuild documents give the same hits"
+            );
+
+            // A revision shrinks row 1: the unchanged chunk after it must lose
+            // the overlap it took from row 1.
+            let conversation_id: i64 = storage
+                .raw()
+                .query_row_map("SELECT id FROM conversations", &[], |row| row.get_typed(0))
+                .unwrap();
+            storage
+                .raw()
+                .execute_compat(
+                    "UPDATE messages SET content = ?1 WHERE conversation_id = ?2 AND idx = 1",
+                    &[
+                        ParamValue::from("a short revision"),
+                        ParamValue::from(conversation_id),
+                    ],
+                )
+                .unwrap();
+            let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
+            let packet =
+                lexical_packet_for_changed_messages(&storage, conversation_id, &[1]).unwrap();
+            publish_changed_packet_messages(
+                &storage,
+                &mut index,
+                &packet,
+                &[0],
+                conversation_id,
+                true,
+            )
+            .unwrap();
+            assert_eq!(tantivy_doc_count(&mut index), 4);
+            drop(index);
+            let client = SearchClient::open(&index_path, Some(&db_path))
+                .unwrap()
+                .unwrap();
+            let search = |query: &str| {
+                client
+                    .search(query, SearchFilters::default(), 10, 0, FieldMask::FULL)
+                    .unwrap()
+            };
+            assert!(
+                search("\"crossingalpha crossingbeta\"").is_empty(),
+                "the successor no longer indexes the old tail"
+            );
+            assert_eq!(search("crossingbeta").len(), 1);
+            assert_eq!(
+                search("loremword").len(),
+                1,
+                "only the reply still has the filler"
+            );
+        }
+
         /// m91r6: a giant conversation persisted in slices must store exactly
         /// what one transaction stores, be searchable at both ends, resume
         /// after a crash between slices, and replay as a no-op.

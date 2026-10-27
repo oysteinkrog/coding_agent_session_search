@@ -741,6 +741,182 @@ fn hydrate_message_content_by_conversation(
     Ok(hydrated)
 }
 
+/// Step 6: the chunk group of every hit whose message row is one chunk of a
+/// split message, keyed by `(conversation_id, idx)`. Only a full-size row or
+/// the row after one can be a chunk, so the chunk records are read for those
+/// rows alone.
+fn split_message_groups_for_hits(
+    conn: &SearchSqliteConnection,
+    hits: &[SearchHit],
+) -> Result<HashMap<TantivyContentExactKey, String>> {
+    let full = i64::try_from(franken_agent_detection::MESSAGE_CHUNK_BYTES.saturating_sub(3))
+        .unwrap_or(i64::MAX);
+    let mut wanted_by_conversation: HashMap<i64, HashSet<i64>> = HashMap::new();
+    for hit in hits {
+        let (Some(conversation_id), Some(line)) = (hit.conversation_id, hit.line_number) else {
+            continue;
+        };
+        let Some(idx) = line.checked_sub(1).and_then(|idx| i64::try_from(idx).ok()) else {
+            continue;
+        };
+        wanted_by_conversation
+            .entry(conversation_id)
+            .or_default()
+            .insert(idx);
+    }
+    let mut groups = HashMap::new();
+    for (conversation_id, hit_indices) in wanted_by_conversation {
+        let mut read: Vec<i64> = hit_indices
+            .iter()
+            .flat_map(|&idx| [idx - 1, idx])
+            .filter(|idx| *idx >= 0)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        read.sort_unstable();
+        let sql = format!(
+            "SELECT idx, COALESCE(octet_length(content), 0)
+             FROM messages INDEXED BY sqlite_autoindex_messages_1
+             WHERE conversation_id = ? AND idx IN ({})",
+            sql_placeholders(read.len())
+        );
+        let mut params = vec![ParamValue::from(conversation_id)];
+        params.extend(read.iter().copied().map(ParamValue::from));
+        let sizes: HashMap<i64, i64> =
+            franken_query_map_collect_retry(conn, &sql, &params, |row| {
+                Ok((row.get_typed(0)?, row.get_typed(1)?))
+            })?
+            .into_iter()
+            .collect();
+        let is_full = |idx: i64| sizes.get(&idx).is_some_and(|bytes| *bytes >= full);
+        let mut candidates: Vec<i64> = hit_indices
+            .into_iter()
+            .filter(|&idx| is_full(idx) || is_full(idx - 1))
+            .collect();
+        if candidates.is_empty() {
+            continue;
+        }
+        candidates.sort_unstable();
+        let sql = format!(
+            "SELECT idx, extra_json, extra_bin
+             FROM messages INDEXED BY sqlite_autoindex_messages_1
+             WHERE conversation_id = ? AND idx IN ({})",
+            sql_placeholders(candidates.len())
+        );
+        let mut params = vec![ParamValue::from(conversation_id)];
+        params.extend(candidates.iter().copied().map(ParamValue::from));
+        let records: Vec<(i64, serde_json::Value)> =
+            franken_query_map_collect_retry(conn, &sql, &params, |row| {
+                Ok((
+                    row.get_typed(0)?,
+                    crate::storage::sqlite::franken_read_message_extra_compat(row, 1, 2),
+                ))
+            })?;
+        for (idx, extra) in records {
+            if let Some(group) = extra
+                .get(franken_agent_detection::MESSAGE_CHUNK_KEY)
+                .and_then(|record| record.get("group"))
+                .filter(|group| !group.is_null())
+            {
+                let group = group
+                    .as_str()
+                    .map_or_else(|| group.to_string(), ToOwned::to_owned);
+                groups.insert((conversation_id, idx), group);
+            }
+        }
+    }
+    Ok(groups)
+}
+
+/// Keep one hit per split message: the best-scored chunk, which keeps its
+/// own `line_number` so a follow-up opens the chunk that matched. Hits of
+/// ordinary messages pass unchanged.
+fn collapse_split_message_hits(
+    hits: Vec<SearchHit>,
+    groups: &HashMap<TantivyContentExactKey, String>,
+) -> Vec<SearchHit> {
+    if groups.is_empty() {
+        return hits;
+    }
+    let mut kept: Vec<SearchHit> = Vec::with_capacity(hits.len());
+    let mut by_group: HashMap<(i64, &str), usize> = HashMap::new();
+    for hit in hits {
+        let group = hit.conversation_id.zip(
+            hit.line_number
+                .and_then(|line| line.checked_sub(1))
+                .and_then(|idx| i64::try_from(idx).ok()),
+        );
+        let group = group.and_then(|key| groups.get(&key).map(|group| (key.0, group.as_str())));
+        let Some(group) = group else {
+            kept.push(hit);
+            continue;
+        };
+        match by_group.get(&group) {
+            Some(&at) => {
+                if kept[at].score < hit.score {
+                    kept[at] = hit;
+                }
+            }
+            None => {
+                by_group.insert(group, kept.len());
+                kept.push(hit);
+            }
+        }
+    }
+    kept
+}
+
+/// The overlap the lexical document of message `idx` indexes before its own
+/// text, when that message continues a split message (see
+/// [`crate::search::chunk_overlap`]). A snippet for a phrase that crosses the
+/// chunk cut needs it, because the stored row holds only the chunk. The text
+/// of the row before is read only when the two rows are chunks of one message.
+fn split_message_overlap_tail(
+    conn: &SearchSqliteConnection,
+    conversation_id: i64,
+    idx: i64,
+) -> Result<Option<String>> {
+    if idx < 1 {
+        return Ok(None);
+    }
+    let rows: Vec<serde_json::Value> = franken_query_map_collect_retry(
+        conn,
+        "SELECT extra_json, extra_bin
+         FROM messages INDEXED BY sqlite_autoindex_messages_1
+         WHERE conversation_id = ?1 AND idx >= ?2 AND idx <= ?3
+         ORDER BY idx",
+        &[
+            ParamValue::from(conversation_id),
+            ParamValue::from(idx - 1),
+            ParamValue::from(idx),
+        ],
+        |row| {
+            Ok(crate::storage::sqlite::franken_read_message_extra_compat(
+                row, 0, 1,
+            ))
+        },
+    )?;
+    let [prev_extra, cur_extra] = rows.as_slice() else {
+        return Ok(None);
+    };
+    if !crate::search::chunk_overlap::chunk_follows(prev_extra, cur_extra) {
+        return Ok(None);
+    }
+    let prev: Vec<String> = franken_query_map_collect_retry(
+        conn,
+        "SELECT content
+         FROM messages INDEXED BY sqlite_autoindex_messages_1
+         WHERE conversation_id = ?1 AND idx = ?2",
+        &[ParamValue::from(conversation_id), ParamValue::from(idx - 1)],
+        |row| row.get_typed(0),
+    )?;
+    let Some(prev) = prev.first() else {
+        return Ok(None);
+    };
+    let tail = crate::search::chunk_overlap::overlap_tail(prev);
+    Ok((!tail.is_empty()).then(|| tail.to_owned()))
+}
+
 fn semantic_message_id_from_db(message_id: i64) -> std::io::Result<u64> {
     u64::try_from(message_id).map_err(|_| std::io::Error::other("negative message_id"))
 }
@@ -4397,6 +4573,30 @@ fn postprocess_hits_page_core(
     (available_hits, paged_hits)
 }
 
+/// Deepest refetch for a short page, as a multiple of the hits the page
+/// needs: one split message can fill this many fetch slots with its chunks.
+const LEXICAL_REFETCH_MAX_TARGET_MULTIPLE: usize = 64;
+
+/// The next fetch size after a full fetch of `fetch_limit` hits left the page
+/// short: first `fallback_fetch_limit` (the historical single retry), then
+/// four times deeper, up to [`LEXICAL_REFETCH_MAX_TARGET_MULTIPLE`] times the
+/// page and never past the index. `None` when no deeper fetch is left.
+fn next_lexical_refetch_limit(
+    fetch_limit: usize,
+    fallback_fetch_limit: usize,
+    target_hits: usize,
+    total_docs: impl FnOnce() -> usize,
+) -> Option<usize> {
+    if fetch_limit < fallback_fetch_limit {
+        return Some(fallback_fetch_limit);
+    }
+    let deepest = target_hits
+        .saturating_mul(LEXICAL_REFETCH_MAX_TARGET_MULTIPLE)
+        .min(total_docs().min(no_limit_result_cap()))
+        .max(fallback_fetch_limit);
+    (fetch_limit < deepest).then(|| fetch_limit.saturating_mul(4).min(deepest))
+}
+
 fn should_try_wildcard_fallback(
     returned_hits: usize,
     limit: usize,
@@ -4778,17 +4978,26 @@ impl SearchClient {
 
                 let (mut deduped_len, mut paged_hits) = page_hits(hits);
 
-                let needs_retry = deduped_len < target_hits
-                    && initial_hit_count == initial_fetch_limit
-                    && initial_fetch_limit < fallback_fetch_limit;
-
-                if needs_retry {
+                // Dedup, post-applied filters and the collapse of split
+                // messages can leave the page short. Refetch deeper while the
+                // last fetch came back full.
+                let mut fetch_limit = initial_fetch_limit;
+                let mut capacity_reached = initial_hit_count == initial_fetch_limit;
+                while deduped_len < target_hits && capacity_reached {
+                    let Some(next_fetch_limit) = next_lexical_refetch_limit(
+                        fetch_limit,
+                        fallback_fetch_limit,
+                        target_hits,
+                        || self.total_docs(),
+                    ) else {
+                        break;
+                    };
                     tracing::debug!(
                         query = sanitized,
                         target_hits,
                         deduped_len,
-                        initial_fetch_limit,
-                        fallback_fetch_limit,
+                        fetch_limit,
+                        next_fetch_limit,
                         session_path_filter_active,
                         "retrying lexical fetch due to dedup or session-path shortfall"
                     );
@@ -4798,16 +5007,19 @@ impl SearchClient {
                         query,
                         &sanitized,
                         filters.clone(),
-                        fallback_fetch_limit,
+                        next_fetch_limit,
                         0,
                         field_mask,
                     )?;
                     if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
                         *tc = retry_total_count;
                     }
-                    if !retry_hits.is_empty() {
-                        (deduped_len, paged_hits) = page_hits(retry_hits);
+                    fetch_limit = next_fetch_limit;
+                    capacity_reached = retry_hits.len() == next_fetch_limit;
+                    if retry_hits.is_empty() {
+                        break;
                     }
+                    (deduped_len, paged_hits) = page_hits(retry_hits);
                 }
 
                 tracing::trace!(
@@ -4855,23 +5067,31 @@ impl SearchClient {
                 };
 
                 let (mut deduped_len, mut paged_hits) = page_hits(hits);
-                let expected_federated_capacity = initial_fetch_limit.saturating_mul(readers.len());
-                let federated_initial_capacity_reached = if session_path_filter_active {
-                    initial_hit_count >= initial_fetch_limit.min(expected_federated_capacity)
-                } else {
-                    initial_hit_count == expected_federated_capacity
+                let capacity_reached_at = |hit_count: usize, fetch_limit: usize| {
+                    let expected_federated_capacity = fetch_limit.saturating_mul(readers.len());
+                    if session_path_filter_active {
+                        hit_count >= fetch_limit.min(expected_federated_capacity)
+                    } else {
+                        hit_count == expected_federated_capacity
+                    }
                 };
-                let needs_retry = deduped_len < target_hits
-                    && federated_initial_capacity_reached
-                    && initial_fetch_limit < fallback_fetch_limit;
-
-                if needs_retry {
+                let mut fetch_limit = initial_fetch_limit;
+                let mut capacity_reached = capacity_reached_at(initial_hit_count, fetch_limit);
+                while deduped_len < target_hits && capacity_reached {
+                    let Some(next_fetch_limit) = next_lexical_refetch_limit(
+                        fetch_limit,
+                        fallback_fetch_limit,
+                        target_hits,
+                        || self.total_docs(),
+                    ) else {
+                        break;
+                    };
                     tracing::debug!(
                         query = sanitized,
                         target_hits,
                         deduped_len,
-                        initial_fetch_limit,
-                        fallback_fetch_limit,
+                        fetch_limit,
+                        next_fetch_limit,
                         shards = readers.len(),
                         session_path_filter_active,
                         "retrying federated lexical fetch due to dedup or session-path shortfall"
@@ -4881,15 +5101,18 @@ impl SearchClient {
                         query,
                         &sanitized,
                         filters.clone(),
-                        fallback_fetch_limit,
+                        next_fetch_limit,
                         field_mask,
                     )?;
                     if let Ok(mut tc) = self.last_tantivy_total_count.lock() {
                         *tc = retry_total_count;
                     }
-                    if !retry_hits.is_empty() {
-                        (deduped_len, paged_hits) = page_hits(retry_hits);
+                    fetch_limit = next_fetch_limit;
+                    capacity_reached = capacity_reached_at(retry_hits.len(), next_fetch_limit);
+                    if retry_hits.is_empty() {
+                        break;
                     }
+                    (deduped_len, paged_hits) = page_hits(retry_hits);
                 }
 
                 tracing::trace!(
@@ -7319,7 +7542,39 @@ impl SearchClient {
         if remote_source_filter_is_post_applied(&filters.source_filter) {
             hits.retain(|hit| hit.origin_kind != crate::sources::provenance::LOCAL_SOURCE_ID);
         }
+        let hits = self.collapse_split_message_hits(hits);
         postprocess_hits_page_core(hits, query, &filters.session_paths, limit, offset)
+    }
+
+    /// One hit per split message (step 6). The callers' adaptive refetch
+    /// treats the hits this drops like any other dedup shortfall. It never
+    /// opens the database itself: a chunk's document holds at least 64 KiB of
+    /// text, so its preview is cut short and the search that found it opened
+    /// the database already (see [`Self::open_sqlite_for_possible_chunks`]).
+    /// Without a database (or on a read error) hits pass unchanged: each chunk
+    /// is then its own hit, as before.
+    fn collapse_split_message_hits(&self, hits: Vec<SearchHit>) -> Vec<SearchHit> {
+        let Ok(guard) = self.sqlite.lock() else {
+            return hits;
+        };
+        let Some(conn) = guard.as_ref() else {
+            return hits;
+        };
+        let groups = split_message_groups_for_hits(conn, &hits).unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "reading chunk records for search hits failed");
+            HashMap::new()
+        });
+        drop(guard);
+        collapse_split_message_hits(hits, &groups)
+    }
+
+    /// Open the hydration database when a hit may be a chunk of a split
+    /// message (its stored preview is cut short), so
+    /// [`Self::collapse_split_message_hits`] can read the chunk records.
+    fn open_sqlite_for_possible_chunks<'a>(&self, mut previews: impl Iterator<Item = &'a str>) {
+        if previews.any(|preview| !stored_preview_is_complete_content(preview)) {
+            drop(self.sqlite_guard());
+        }
     }
 
     /// Search with automatic wildcard fallback for sparse results.
@@ -7819,6 +8074,20 @@ impl SearchClient {
         *guard = Some(generation);
     }
 
+    fn split_message_overlap_tail_for(
+        &self,
+        conversation_id: Option<i64>,
+        line_number: Option<usize>,
+    ) -> Option<String> {
+        let idx = i64::try_from(line_number?.checked_sub(1)?).ok()?;
+        let guard = self.sqlite_guard().ok()?;
+        let conn = guard.as_ref()?;
+        split_message_overlap_tail(conn, conversation_id?, idx).unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "reading the chunk overlap for a snippet failed");
+            None
+        })
+    }
+
     fn hydrate_tantivy_hit_contents(
         &self,
         exact_keys: &[TantivyContentExactKey],
@@ -8175,6 +8444,12 @@ impl SearchClient {
         } else {
             None
         };
+        self.open_sqlite_for_possible_chunks(
+            pending_hits
+                .iter()
+                .filter(|pending| pending.conversation_id.is_some())
+                .map(|pending| pending.stored_preview.as_str()),
+        );
         let mut hits = Vec::with_capacity(pending_hits.len());
         for pending in pending_hits {
             let hydrated_content = pending
@@ -8199,11 +8474,15 @@ impl SearchClient {
                     || (field_mask.needs_content()
                         && field_mask.preview_content_limit().is_none()
                         && stored_preview_is_complete_content(&pending.stored_preview)));
+            // Only the hydrated row is the chunk's own text; a stored preview
+            // already starts with the overlap.
+            let mut content_is_hydrated_row = false;
             let effective_content = if !pending.stored_content.is_empty() {
                 pending.stored_content.clone()
             } else if preview_satisfies_effective_content {
                 pending.stored_preview.clone()
             } else if let Some(content) = hydrated_content {
+                content_is_hydrated_row = true;
                 content
             } else {
                 pending.stored_preview.clone()
@@ -8220,7 +8499,29 @@ impl SearchClient {
                     let rendered = if !pending.stored_content.is_empty() {
                         generator.snippet(&pending.stored_content)
                     } else if !effective_content.is_empty() {
-                        generator.snippet(&effective_content)
+                        // A continuation chunk's document also indexes the
+                        // tail of the chunk before it, where a phrase across
+                        // the cut starts. Its preview is then cut short too,
+                        // so only such hits pay for the lookup.
+                        let overlap = if !content_is_hydrated_row
+                            || stored_preview_is_complete_content(&pending.stored_preview)
+                        {
+                            None
+                        } else {
+                            self.split_message_overlap_tail_for(
+                                pending.conversation_id,
+                                pending.line_number,
+                            )
+                        };
+                        match overlap {
+                            Some(tail) => {
+                                generator.snippet(&crate::search::chunk_overlap::lexical_text(
+                                    Some(&tail),
+                                    &effective_content,
+                                ))
+                            }
+                            None => generator.snippet(&effective_content),
+                        }
                     } else {
                         None
                     };
@@ -23374,6 +23675,135 @@ mod tests {
     // =============================================================================
     // SQL Placeholder Builder Tests (Opt 4.5: Pre-sized String Buffers)
     // =============================================================================
+
+    /// Step 6 ranking check: how much the overlap in front of a continuation
+    /// chunk lowers the score and rank of a term in the chunk's own text,
+    /// over a spread of chunk sizes. A measurement, run on demand with
+    /// `--ignored --nocapture`; it asserts only that the hit is still found.
+    #[test]
+    #[ignore = "measurement; prints scores"]
+    fn chunk_overlap_ranking_effect_over_chunk_sizes() {
+        use crate::search::chunk_overlap::{MAX_CROSS_CHUNK_PHRASE_BYTES, overlap_tail};
+
+        let filler_word = |i: usize| format!("fill{} ", i % 997);
+        let filler = |bytes: usize| {
+            let mut text = String::new();
+            let mut i = 0;
+            while text.len() < bytes {
+                text.push_str(&filler_word(i));
+                i += 1;
+            }
+            text
+        };
+        let previous_chunk = filler(MAX_CROSS_CHUNK_PHRASE_BYTES * 2);
+        let tail = overlap_tail(&previous_chunk).to_string();
+        let message = |path: &str, content: String| NormalizedConversation {
+            agent_slug: "agent".into(),
+            external_id: None,
+            title: None,
+            workspace: None,
+            source_path: path.into(),
+            started_at: None,
+            ended_at: None,
+            metadata: serde_json::json!({}),
+            messages: vec![NormalizedMessage {
+                idx: 0,
+                role: "user".into(),
+                author: None,
+                created_at: Some(1000),
+                content,
+                extra: serde_json::json!({}),
+                snippets: Vec::new(),
+                invocations: Vec::new(),
+            }],
+        };
+        for chunk_bytes in [1 << 10, 16 << 10, 256 << 10, 4 << 20] {
+            // The term sits in the middle of the chunk's own text, as in a
+            // real chunk; at the start it would also match the content prefix
+            // field, which the overlap moves away from the document start.
+            let own = format!(
+                "{} rankneedle {}",
+                filler(chunk_bytes / 2),
+                filler(chunk_bytes / 2)
+            );
+            let mut observed = Vec::new();
+            for with_overlap in [false, true] {
+                let dir = TempDir::new().unwrap();
+                let mut index = TantivyIndex::open_or_create(dir.path()).unwrap();
+                for i in 0..20 {
+                    let needle = if i % 4 == 0 { "rankneedle " } else { "" };
+                    let half = filler(1024 + i * 256);
+                    index
+                        .add_conversation(&message(
+                            &format!("background/{i}"),
+                            format!("{half}{needle}{half}"),
+                        ))
+                        .unwrap();
+                }
+                let content = if with_overlap {
+                    crate::search::chunk_overlap::lexical_text(Some(&tail), &own)
+                } else {
+                    own.clone()
+                };
+                index.add_conversation(&message("target", content)).unwrap();
+                index.commit().unwrap();
+                drop(index);
+                let client = SearchClient::open(dir.path(), None).unwrap().unwrap();
+                let hits = client
+                    .search(
+                        "rankneedle",
+                        SearchFilters::default(),
+                        50,
+                        0,
+                        FieldMask::FULL,
+                    )
+                    .unwrap();
+                let rank = hits
+                    .iter()
+                    .position(|hit| hit.source_path == "target")
+                    .expect("the target is found");
+                observed.push((hits[rank].score, rank + 1, hits.len()));
+            }
+            let (plain, overlapped) = (observed[0], observed[1]);
+            println!(
+                "chunk {:>8} B: score {:.4} -> {:.4} ({:+.1}%), rank {} -> {} of {}",
+                own.len(),
+                plain.0,
+                overlapped.0,
+                (overlapped.0 / plain.0 - 1.0) * 100.0,
+                plain.1,
+                overlapped.1,
+                overlapped.2
+            );
+        }
+    }
+
+    #[test]
+    fn a_short_page_refetches_four_times_deeper_up_to_a_bound() {
+        // First the historical single retry, then four times deeper.
+        assert_eq!(
+            next_lexical_refetch_limit(20, 30, 10, || 1_000_000),
+            Some(30)
+        );
+        assert_eq!(
+            next_lexical_refetch_limit(30, 30, 10, || 1_000_000),
+            Some(120)
+        );
+        assert_eq!(
+            next_lexical_refetch_limit(120, 30, 10, || 1_000_000),
+            Some(480)
+        );
+        assert_eq!(
+            next_lexical_refetch_limit(480, 30, 10, || 1_000_000),
+            Some(640)
+        );
+        assert_eq!(next_lexical_refetch_limit(640, 30, 10, || 1_000_000), None);
+        // Never past the index, never below the fallback.
+        assert_eq!(next_lexical_refetch_limit(30, 30, 10, || 50), Some(50));
+        assert_eq!(next_lexical_refetch_limit(50, 30, 10, || 50), None);
+        // A fallback that is already deeper (a session-path filter) is final.
+        assert_eq!(next_lexical_refetch_limit(900, 900, 10, || 1_000_000), None);
+    }
 
     #[test]
     fn sql_placeholders_empty() {
