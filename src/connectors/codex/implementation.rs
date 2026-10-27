@@ -205,7 +205,12 @@ fn augment_modern_codex_reader(
             .iter()
             .enumerate()
             .filter(|(_, message)| !is_continuation_chunk(message))
-            .map(|(index, message)| (modern_codex_message_signature(message), index))
+            .map(|(index, message)| {
+                (
+                    whole_message_signature(&conversation.messages, index),
+                    index,
+                )
+            })
             .collect();
     let mut message_indices_by_call_id: HashMap<String, usize> = conversation
         .messages
@@ -313,11 +318,7 @@ fn augment_modern_codex_reader(
         }
 
         let message_index = conversation.messages.len();
-        // A message over the chunk size is added as ordered chunks, with
-        // chunk 0 standing for it in the indices.
-        conversation
-            .messages
-            .extend(franken_agent_detection::chunk_message(message));
+        conversation.messages.push(message);
         let stored = &conversation.messages[message_index];
         message_indices_by_signature.insert(message_signature, message_index);
         message_indices_by_call_id
@@ -326,7 +327,24 @@ fn augment_modern_codex_reader(
         added = true;
     }
 
+    // Split every message over the chunk size now, after matching, so the
+    // indices above saw whole messages. This covers messages the pass added
+    // and placeholders a merge filled with long arguments.
+    if conversation
+        .messages
+        .iter()
+        .any(|message| message.content.len() > franken_agent_detection::MESSAGE_CHUNK_BYTES)
+    {
+        conversation.messages = std::mem::take(&mut conversation.messages)
+            .into_iter()
+            .flat_map(franken_agent_detection::chunk_message)
+            .collect();
+        added = true;
+    }
+
     if added {
+        // A stable sort: the chunks of one message share its time and idx, so
+        // they stay together and in order.
         conversation.messages.sort_by(|left, right| {
             left.created_at
                 .cmp(&right.created_at)
@@ -654,24 +672,76 @@ fn is_continuation_chunk(message: &NormalizedMessage) -> bool {
         .is_some_and(|ordinal| ordinal > 0)
 }
 
-/// Hash of a raw record. Chunk 0 of a split message carries the raw record
-/// plus a chunk record, which is left out so it still matches the raw line.
-fn modern_codex_raw_signature(raw: &Value) -> [u8; 32] {
-    let stripped;
-    let raw = match raw.as_object() {
-        Some(map) if map.contains_key(franken_agent_detection::MESSAGE_CHUNK_KEY) => {
-            let mut map = map.clone();
-            map.remove(franken_agent_detection::MESSAGE_CHUNK_KEY);
-            stripped = Value::Object(map);
-            &stripped
-        }
-        _ => raw,
-    };
-    let mut bytes = Vec::new();
-    if serde_json::to_writer(&mut bytes, raw).is_err() {
-        bytes.extend_from_slice(raw.to_string().as_bytes());
+/// Signature of the message at `index`. For chunk 0 of a split message the
+/// content hash covers the whole text, read from the chunks that follow it,
+/// so it matches a candidate that carries the whole message.
+fn whole_message_signature(
+    messages: &[NormalizedMessage],
+    index: usize,
+) -> ModernCodexMessageSignature {
+    let message = &messages[index];
+    let count = message
+        .extra
+        .get(franken_agent_detection::MESSAGE_CHUNK_KEY)
+        .and_then(|record| record.get("count"))
+        .and_then(Value::as_u64)
+        .and_then(|count| usize::try_from(count).ok())
+        .unwrap_or(1);
+    if count <= 1 {
+        return modern_codex_message_signature(message);
     }
-    *blake3::hash(&bytes).as_bytes()
+    let mut hasher = blake3::Hasher::new();
+    let end = index.saturating_add(count).min(messages.len());
+    for chunk in &messages[index..end] {
+        hasher.update(chunk.content.as_bytes());
+    }
+    ModernCodexMessageSignature {
+        role: message.role.clone(),
+        author: message.author.clone(),
+        created_at: message.created_at,
+        content_hash: *hasher.finalize().as_bytes(),
+    }
+}
+
+/// Hash of a raw record, as its compact JSON. Chunk 0 of a split message
+/// carries the raw record plus a chunk record, which is left out so it still
+/// matches the raw line. The JSON is streamed into the hash, never copied.
+fn modern_codex_raw_signature(raw: &Value) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    let written = match raw.as_object() {
+        Some(map) if map.contains_key(franken_agent_detection::MESSAGE_CHUNK_KEY) => {
+            write_object_without_chunk_record(&mut hasher, map)
+        }
+        _ => serde_json::to_writer(&mut hasher, raw).map_err(io::Error::from),
+    };
+    if written.is_err() {
+        hasher = blake3::Hasher::new();
+        hasher.update(raw.to_string().as_bytes());
+    }
+    *hasher.finalize().as_bytes()
+}
+
+/// Write `map` as compact JSON, as `serde_json::to_writer` would, minus the
+/// chunk record.
+fn write_object_without_chunk_record(
+    out: &mut impl io::Write,
+    map: &serde_json::Map<String, Value>,
+) -> io::Result<()> {
+    out.write_all(b"{")?;
+    let mut first = true;
+    for (key, value) in map {
+        if key == franken_agent_detection::MESSAGE_CHUNK_KEY {
+            continue;
+        }
+        if !first {
+            out.write_all(b",")?;
+        }
+        first = false;
+        serde_json::to_writer(&mut *out, key)?;
+        out.write_all(b":")?;
+        serde_json::to_writer(&mut *out, value)?;
+    }
+    out.write_all(b"}")
 }
 
 fn modern_codex_message_call_ids(message: &NormalizedMessage) -> impl Iterator<Item = String> + '_ {
@@ -1041,6 +1111,76 @@ mod tests {
         augment_modern_codex_messages(&mut conversation, None)?;
         assert_eq!(serde_json::to_value(&conversation)?, before);
         Ok(())
+    }
+
+    #[test]
+    fn a_split_fad_message_with_compact_extra_is_matched_by_its_whole_text() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("rollout-compact.jsonl");
+        let text = "w".repeat(franken_agent_detection::MESSAGE_CHUNK_BYTES + 10);
+        let line = response(serde_json::json!({
+            "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": text}]
+        }));
+        std::fs::write(&path, format!("{line}\n"))?;
+        // As FAD stores it in a large rollout: compact extra, split in two.
+        let mut stored = modern_codex_message(&line).expect("message");
+        assert_eq!(stored.content, text);
+        stored.extra = serde_json::json!({"compacted": true});
+        let mut conversation = conversation_at(&path);
+        conversation.messages = franken_agent_detection::chunk_message(stored);
+        assert_eq!(conversation.messages.len(), 2);
+        let before = serde_json::to_value(&conversation)?;
+        augment_modern_codex_messages(&mut conversation, None)?;
+        assert_eq!(
+            serde_json::to_value(&conversation)?,
+            before,
+            "the whole-text candidate matches the split message; nothing is added"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_placeholder_filled_with_long_input_is_split_into_chunks() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("rollout-long-input.jsonl");
+        let input = "p".repeat(franken_agent_detection::MESSAGE_CHUNK_BYTES + 10);
+        let call = custom_call("patch-1", &input);
+        std::fs::write(&path, format!("{call}\n"))?;
+        let mut canonical = modern_codex_message(&call).expect("call");
+        let whole = canonical.content.clone();
+        canonical.content = "[Tool: apply_patch]".to_string();
+        canonical.extra = serde_json::json!({"compacted": true});
+        let mut conversation = conversation_at(&path);
+        conversation.messages.push(canonical);
+        augment_modern_codex_messages(&mut conversation, None)?;
+        assert_eq!(conversation.messages.len(), 2);
+        let joined: String = conversation
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(joined, whole);
+        assert_eq!(conversation.messages[0].invocations.len(), 1);
+        assert!(is_continuation_chunk(&conversation.messages[1]));
+        Ok(())
+    }
+
+    #[test]
+    fn the_raw_hash_of_chunk_zero_matches_its_raw_line() {
+        let raw = response(serde_json::json!({"type": "message", "role": "user", "content": "hi"}));
+        let mut with_record = raw.clone();
+        with_record[franken_agent_detection::MESSAGE_CHUNK_KEY] = serde_json::json!({"ordinal": 0});
+        assert_eq!(
+            modern_codex_raw_signature(&with_record),
+            modern_codex_raw_signature(&raw)
+        );
+        let mut bytes = Vec::new();
+        serde_json::to_writer(&mut bytes, &raw).unwrap();
+        assert_eq!(
+            modern_codex_raw_signature(&raw),
+            *blake3::hash(&bytes).as_bytes()
+        );
     }
 
     #[test]
