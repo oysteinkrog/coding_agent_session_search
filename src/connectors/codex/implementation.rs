@@ -230,7 +230,7 @@ fn augment_modern_codex_reader(
             .iter()
             .enumerate()
             .filter(|(_, message)| !is_continuation_chunk(message))
-            .map(|(index, message)| {
+            .map(|(index, _)| {
                 (
                     whole_message_signature(&conversation.messages, index),
                     index,
