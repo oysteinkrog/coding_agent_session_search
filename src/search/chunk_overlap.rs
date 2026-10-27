@@ -28,6 +28,9 @@ pub const MAX_CROSS_CHUNK_PHRASE_BYTES: usize = 64 * 1024;
 /// How far before the limit the overlap may start, to begin at whitespace.
 const RESTART_SEARCH_BYTES: usize = 4 * 1024;
 
+/// The longest overlap [`overlap_tail`] returns.
+pub const MAX_OVERLAP_BYTES: usize = MAX_CROSS_CHUNK_PHRASE_BYTES + RESTART_SEARCH_BYTES;
+
 /// Bump when the overlap rule changes, so lexical indexes built with the old
 /// rule are rebuilt.
 pub const CHUNK_OVERLAP_VERSION: u32 = 1;
@@ -153,7 +156,7 @@ mod tests {
         let prev = "word ".repeat(30_000);
         let tail = overlap_tail(&prev);
         assert!(tail.len() >= MAX_CROSS_CHUNK_PHRASE_BYTES, "{}", tail.len());
-        assert!(tail.len() <= MAX_CROSS_CHUNK_PHRASE_BYTES + RESTART_SEARCH_BYTES);
+        assert!(tail.len() <= MAX_OVERLAP_BYTES);
         let start = prev.len() - tail.len();
         assert!(prev[..start].ends_with(' '));
     }

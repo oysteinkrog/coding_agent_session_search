@@ -8764,7 +8764,7 @@ fn bounded_lexical_rebuild_page_reservation_limits(
 }
 
 /// Size a page so a typical page of conversations fits its content
-/// reservation: at most one per-message cap's worth of text per conversation.
+/// reservation: at most one message chunk (plus its overlap) per conversation.
 /// This is a heuristic; the byte-budgeted batch fetch enforces the real bound
 /// (it stops reading a conversation that cannot fit), and a long conversation
 /// falls back to the prep worker's chunked path (bgn6s).
@@ -8773,11 +8773,10 @@ fn lexical_rebuild_content_bounded_page_conversation_limit(
     batch_fetch_message_bytes_limit: usize,
 ) -> usize {
     let batch_fetch_message_bytes_limit = batch_fetch_message_bytes_limit.max(1);
-    let effective_conversation_content_cap =
-        crate::storage::sqlite::lexical_max_message_content_bytes()
-            .min(i32::MAX as usize)
-            .min(batch_fetch_message_bytes_limit)
-            .max(1);
+    let effective_conversation_content_cap = (franken_agent_detection::MESSAGE_CHUNK_BYTES
+        + crate::search::chunk_overlap::MAX_OVERLAP_BYTES)
+        .min(batch_fetch_message_bytes_limit)
+        .max(1);
     configured_page_conversation_limit.max(1).min(
         batch_fetch_message_bytes_limit
             .saturating_div(effective_conversation_content_cap)
@@ -10209,7 +10208,8 @@ fn expected_live_lexical_doc_count(storage: &FrankenStorage) -> Result<usize> {
 const EXPECTED_LEXICAL_DOCS_CACHE_FILE: &str = ".expected-lexical-docs.json";
 /// 2: counts under the per-message cap (bgn6s). A v1 memo counted a long
 /// conversation's messages past its first 8 MiB as noise and must be recounted.
-const EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION: u32 = 2;
+/// 3: whole messages with the chunk overlap (step 6); the cap is gone.
+const EXPECTED_LEXICAL_DOCS_CACHE_SCHEMA_VERSION: u32 = 3;
 /// Recount in full after this many consecutive append deltas. The identity
 /// (like the lexical checkpoint fingerprint it extends) cannot see an in-place
 /// content edit of an existing row; this bounds how long such an edit can skew
@@ -10222,7 +10222,7 @@ struct ExpectedLexicalDocsIdentity {
     max_conversation_id: i64,
     max_message_id: i64,
     total_messages: usize,
-    content_cap_bytes: usize,
+    chunk_overlap_version: u32,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -10259,9 +10259,8 @@ fn expected_lexical_docs_identity(
         max_conversation_id: max_conversation_id_exact(storage)?.unwrap_or(0),
         max_message_id,
         total_messages,
-        // The same per-message cap the rebuild's message stream applies.
-        content_cap_bytes: crate::storage::sqlite::lexical_max_message_content_bytes()
-            .min(i32::MAX as usize),
+        // The overlap rule the rebuild's message stream applies.
+        chunk_overlap_version: crate::search::chunk_overlap::CHUNK_OVERLAP_VERSION,
     })
 }
 
@@ -10269,17 +10268,18 @@ fn expected_lexical_docs_identity(
 /// or `None` when the archive changed in any way an append cannot explain.
 ///
 /// Sound only for pure appends: no conversation or message was deleted (both
-/// totals grew by exactly the rows beyond the memoized maxima) and the content
-/// cap is unchanged. The cap applies to each message on its own, so appending
-/// rows never changes an older message's truncation or noise classification,
-/// and only the new messages need classifying, exactly as the full scan would.
+/// totals grew by exactly the rows beyond the memoized maxima) and the overlap
+/// rule is unchanged. A row's indexed text depends only on itself and the row
+/// before it, so appending rows never changes an older message's noise
+/// classification, and only the new messages need classifying, exactly as the
+/// full scan would.
 fn expected_live_lexical_doc_count_delta(
     storage: &FrankenStorage,
     cached: &ExpectedLexicalDocsCache,
     current: &ExpectedLexicalDocsIdentity,
 ) -> Result<Option<usize>> {
     let old = &cached.identity;
-    if old.content_cap_bytes != current.content_cap_bytes
+    if old.chunk_overlap_version != current.chunk_overlap_version
         || current.max_message_id < old.max_message_id
         || current.max_conversation_id < old.max_conversation_id
         || current.total_conversations < old.total_conversations
@@ -33294,9 +33294,9 @@ pub mod persist {
 
     /// Indexed-text bytes read per step when a whole canonical conversation is
     /// replayed inline, so a conversation with gigabytes of history never has
-    /// more than one chunk in memory (bgn6s). Each message is still capped by
-    /// `lexical_max_message_content_bytes`, so a chunk exceeds this only when
-    /// it holds a single message.
+    /// more than one chunk in memory (bgn6s). A message over 4 MiB is stored
+    /// as chunk rows, so a step exceeds this only when it holds a single
+    /// message.
     const CANONICAL_LEXICAL_REPLAY_CHUNK_BYTES: usize = 64 * 1024 * 1024;
 
     /// The canonical conversation a lexical packet is built on, without its
@@ -33479,6 +33479,7 @@ pub mod persist {
     }
 
     fn publish_changed_packet_messages(
+        storage: &FrankenStorage,
         index: &mut TantivyIndex,
         packet: &ConversationPacket,
         positional: &[usize],
@@ -33486,12 +33487,51 @@ pub mod persist {
         has_revisions: bool,
     ) -> Result<()> {
         if has_revisions {
-            index.reconcile_messages_from_packet(packet, positional, Some(conversation_id))
+            index.reconcile_messages_from_packet(packet, positional, Some(conversation_id))?;
         } else {
-            index.add_messages_from_packet(packet, Some(positional), Some(conversation_id), |_| {
-                Ok(())
-            })
+            index.add_messages_from_packet(
+                packet,
+                Some(positional),
+                Some(conversation_id),
+                |_| Ok(()),
+            )?;
         }
+        refresh_unchanged_chunk_successors(storage, index, packet, positional, conversation_id)
+    }
+
+    /// Step 6: the document of chunk k+1 indexes the tail of chunk k, so a
+    /// changed row k must refresh an unchanged chunk k+1 too: its overlap may
+    /// have changed or, when row k shrank or left the message, must go. Every
+    /// chunk of a message shares a group derived from the whole text, so a
+    /// change to one chunk normally rewrites all of them and this finds
+    /// nothing; it guards the rule rather than a known path. An append has
+    /// no rows after it, so the usual cost is one empty indexed query.
+    fn refresh_unchanged_chunk_successors(
+        storage: &FrankenStorage,
+        index: &mut TantivyIndex,
+        packet: &ConversationPacket,
+        positional: &[usize],
+        conversation_id: i64,
+    ) -> Result<()> {
+        let messages = &packet.payload.messages;
+        let changed: HashSet<i64> = positional
+            .iter()
+            .filter_map(|&position| messages.get(position))
+            .map(|message| message.idx)
+            .collect();
+        let mut successors: Vec<i64> = changed
+            .iter()
+            .map(|idx| idx + 1)
+            .filter(|idx| !changed.contains(idx))
+            .collect();
+        successors.sort_unstable();
+        for successor in storage.lexical_chunk_continuations(conversation_id, &successors)? {
+            let refreshed =
+                lexical_packet_for_changed_messages(storage, conversation_id, &[successor])?;
+            let positions: Vec<usize> = (0..refreshed.payload.messages.len()).collect();
+            index.reconcile_messages_from_packet(&refreshed, &positions, Some(conversation_id))?;
+        }
+        Ok(())
     }
 
     /// Conversations the inline rebuild already replayed in full in this
@@ -33503,8 +33543,7 @@ pub mod persist {
     /// inserted messages published.
     static INLINE_REBUILD_REPLAYED: std::sync::LazyLock<
         std::sync::Mutex<HashSet<(std::path::PathBuf, std::path::PathBuf, i64)>>,
-    > =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
 
     fn publish_conversation_for_inline_rebuild(
         storage: &FrankenStorage,
@@ -33536,6 +33575,7 @@ pub mod persist {
                 return Ok(());
             }
             return publish_changed_packet_messages(
+                storage,
                 index,
                 &packet,
                 &positional,
@@ -34900,6 +34940,7 @@ pub mod persist {
                                 Err(anyhow::anyhow!("out of memory"))
                             } else {
                                 publish_changed_packet_messages(
+                                    storage,
                                     t_index.as_deref_mut().expect(
                                         "incremental inline updates require Tantivy writer",
                                     ),
@@ -35303,6 +35344,7 @@ pub mod persist {
             let positional = positional_indices_for_inserted(&packet, &changed_indices);
             if !positional.is_empty() {
                 publish_changed_packet_messages(
+                    storage,
                     t_index,
                     &packet,
                     &positional,
@@ -35370,6 +35412,7 @@ pub mod persist {
             if !positional.is_empty() {
                 let tantivy_add_started = Instant::now();
                 publish_changed_packet_messages(
+                    storage,
                     t_index,
                     &packet,
                     &positional,
@@ -36101,6 +36144,7 @@ pub mod persist {
                                     Err(anyhow::anyhow!("out of memory"))
                                 } else {
                                     publish_changed_packet_messages(
+                                        storage,
                                         t_index.as_deref_mut().expect(
                                             "incremental inline updates require Tantivy writer",
                                         ),
@@ -36603,8 +36647,9 @@ pub mod persist {
         fn assert_gh466_canonical_prefix_cap(agent_slug: &str, route: usize, expand_prefix: bool) {
             use crate::search::query::{FieldMask, SearchClient, SearchFilters};
 
-            let cap = if expand_prefix { 8 * 1024 * 1024 } else { 128 };
-            let _cap = set_env("CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES", &cap.to_string());
+            // Size of the oversized fresh source variant, or the repeat count
+            // of the long appended message.
+            let size = if expand_prefix { 8 * 1024 * 1024 } else { 128 };
             let _defer = set_env("CASS_DEFER_LEXICAL_UPDATES", "0");
             let _begin = set_env(
                 "CASS_INDEXER_BEGIN_CONCURRENT",
@@ -36699,22 +36744,22 @@ pub mod persist {
 
             if expand_prefix {
                 // Same identity and timestamp, but the newly parsed source
-                // exceeds the real default cap. Persistence retains the short
-                // canonical row, and the lexical projection indexes that row.
+                // is 8 MiB. Persistence retains the short canonical row, and
+                // the lexical projection indexes that row.
                 let fresh_prefix = "oversized fresh prefix ";
-                conv.messages[0].content = fresh_prefix.repeat(cap / fresh_prefix.len() + 1);
-                assert!(conv.messages[0].content.len() > cap);
+                conv.messages[0].content = fresh_prefix.repeat(size / fresh_prefix.len() + 1);
+                assert!(conv.messages[0].content.len() > size);
                 conv.messages.push(make_message(2, "appended delta".into()));
                 conv.messages.push(make_message(3, "quartzcharlie".into()));
             } else {
-                // The first append exceeds the per-message cap: only its tail
-                // is dropped. The following message is indexed in full, as it
-                // is however much text the conversation already holds (bgn6s).
+                // The first append is long and is indexed whole (step 6). The
+                // following message is indexed in full too, however much text
+                // the conversation already holds (bgn6s).
                 conv.messages.push(make_message(
                     2,
                     format!(
                         "quartzcharlie {} tailbeyondcap",
-                        "bounded text ".repeat(cap)
+                        "bounded text ".repeat(size)
                     ),
                 ));
                 conv.messages
@@ -36782,15 +36827,10 @@ pub mod persist {
                 .map(|message| message.content.len())
                 .sum();
             if expand_prefix {
-                assert!(retained_bytes < cap);
+                assert!(retained_bytes < size);
                 assert_eq!(packet.payload.messages[1].content, "quartzcharlie");
             } else {
-                assert_eq!(packet.payload.messages[0].content.len(), cap);
-                assert!(
-                    packet.payload.messages[0]
-                        .content
-                        .starts_with("quartzcharlie ")
-                );
+                assert_eq!(packet.payload.messages[0].content, conv.messages[2].content);
                 assert_eq!(packet.payload.messages[1].content, "beyondcapneedle");
             }
             assert_eq!(
@@ -36839,30 +36879,30 @@ pub mod persist {
                     1,
                     "appended marker must be searchable exactly once"
                 );
-                for absent in ["tailbeyondcap", "oversized"] {
-                    assert!(
-                        client
-                            .search(absent, SearchFilters::default(), 10, 0, FieldMask::FULL)
-                            .unwrap()
-                            .is_empty(),
-                        "{absent} lies past a message cap or in a replaced source variant"
-                    );
-                }
+                assert!(
+                    client
+                        .search(
+                            "oversized",
+                            SearchFilters::default(),
+                            10,
+                            0,
+                            FieldMask::FULL
+                        )
+                        .unwrap()
+                        .is_empty(),
+                    "oversized lies in a replaced source variant"
+                );
                 if !expand_prefix {
-                    assert_eq!(
-                        client
-                            .search(
-                                "beyondcapneedle",
-                                SearchFilters::default(),
-                                10,
-                                0,
-                                FieldMask::FULL
-                            )
-                            .unwrap()
-                            .len(),
-                        1,
-                        "a message after a capped one stays searchable (bgn6s)"
-                    );
+                    for needle in ["tailbeyondcap", "beyondcapneedle"] {
+                        assert_eq!(
+                            client
+                                .search(needle, SearchFilters::default(), 10, 0, FieldMask::FULL)
+                                .unwrap()
+                                .len(),
+                            1,
+                            "{needle}: a long message and the one after it stay searchable"
+                        );
+                    }
                 }
                 let hit = &hits[0];
                 assert_eq!(hit.agent, agent_slug);
@@ -36921,7 +36961,7 @@ pub mod persist {
 
         #[test]
         #[serial]
-        fn gh466_incremental_lexical_cap_uses_retained_canonical_prefix_for_every_route() {
+        fn gh466_incremental_lexical_update_uses_retained_canonical_prefix_for_every_route() {
             for agent in ["claude_code", "codex"] {
                 for route in 0..3 {
                     assert_gh466_canonical_prefix_cap(agent, route, true);
@@ -36931,7 +36971,7 @@ pub mod persist {
 
         #[test]
         #[serial]
-        fn gh466_incremental_append_after_a_capped_message_stays_searchable() {
+        fn gh466_incremental_append_after_a_long_message_stays_searchable() {
             for route in 0..3 {
                 assert_gh466_canonical_prefix_cap("claude_code", route, false);
             }
@@ -36945,7 +36985,6 @@ pub mod persist {
         fn chunked_canonical_replay_indexes_every_message_of_a_long_conversation() {
             use crate::search::query::{FieldMask, SearchClient, SearchFilters};
 
-            let _cap = set_env("CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES", "40");
             let _defer = set_env("CASS_DEFER_LEXICAL_UPDATES", "1");
             let dir = tempfile::TempDir::new().unwrap();
             let storage = create_franken_db(&dir.path().join("agent_search.db"));
@@ -36996,7 +37035,11 @@ pub mod persist {
                 .lexical_rebuild_message_footprints(conversation_id)
                 .unwrap();
             assert_eq!(footprints.len(), markers.len());
-            assert_eq!(footprints[2].1, 40, "footprints report the capped length");
+            assert_eq!(
+                footprints[2].1,
+                conv.messages[2].content.len(),
+                "footprints report the whole length"
+            );
             assert_eq!(
                 super::super::lexical_rebuild_conversation_chunks(&footprints, 1).len(),
                 markers.len(),
@@ -37025,7 +37068,7 @@ pub mod persist {
             for marker in markers {
                 assert_eq!(hits(marker), 1, "{marker} must be searchable exactly once");
             }
-            assert_eq!(hits("tailmark"), 0, "text past one message's cap stays out");
+            assert_eq!(hits("tailmark"), 1, "a long message is indexed whole");
         }
 
         /// m91r6: a giant conversation persisted in slices must store exactly
@@ -47325,24 +47368,23 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn lexical_rebuild_page_conversation_limit_respects_message_content_cap() {
-        let _cap = set_env("CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES", "8");
-
+    fn lexical_rebuild_page_conversation_limit_fits_one_chunk_per_conversation() {
+        let chunk = franken_agent_detection::MESSAGE_CHUNK_BYTES
+            + crate::search::chunk_overlap::MAX_OVERLAP_BYTES;
         assert_eq!(
-            lexical_rebuild_content_bounded_page_conversation_limit(32, 20),
+            lexical_rebuild_content_bounded_page_conversation_limit(32, 2 * chunk + chunk / 2),
             2,
-            "two eight-byte message caps fit inside a twenty-byte page budget"
+            "two chunks with their overlap fit inside a two-and-a-half chunk page budget"
         );
         assert_eq!(
-            lexical_rebuild_content_bounded_page_conversation_limit(1, 20),
+            lexical_rebuild_content_bounded_page_conversation_limit(1, 3 * chunk),
             1,
             "the content bound must not enlarge an explicitly smaller page"
         );
         assert_eq!(
             lexical_rebuild_content_bounded_page_conversation_limit(32, 4),
             1,
-            "a page smaller than one message cap must still admit one outlier"
+            "a page smaller than one chunk must still admit one outlier"
         );
     }
 
@@ -60727,7 +60769,6 @@ mod tests {
 
         // A 64-byte page budget holds two 21-byte messages: the long
         // conversation (126 bytes) becomes three chunks.
-        let _cap = set_env("CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES", "40");
         let _commit_bytes = set_env("CASS_TANTIVY_REBUILD_COMMIT_EVERY_MESSAGE_BYTES", "64");
         let _initial_commit_bytes = set_env(
             "CASS_TANTIVY_REBUILD_INITIAL_COMMIT_EVERY_MESSAGE_BYTES",

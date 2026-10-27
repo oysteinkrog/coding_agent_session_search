@@ -1764,7 +1764,7 @@ pub(crate) fn recovery_conversation_row_from_lenient_columns(
     }
 }
 
-fn franken_read_message_extra_compat(
+pub(crate) fn franken_read_message_extra_compat(
     row: &FrankenRow,
     json_idx: usize,
     bin_idx: usize,
@@ -4898,59 +4898,38 @@ pub struct LexicalRebuildGroupedMessageRow {
 
 pub type LexicalRebuildGroupedMessageRows = SmallVec<[LexicalRebuildGroupedMessageRow; 32]>;
 
-/// Default per-message lexical-content byte ceiling (#290).
-///
-/// 8 MiB of one message's text is far more than lexical search needs (tokens,
-/// not raw blobs) and keeps a single pasted image/base64 payload from
-/// dominating a rebuild's working set.
-pub const LEXICAL_MAX_MESSAGE_CONTENT_BYTES_DEFAULT: usize = 8 * 1024 * 1024;
-
-/// Per-MESSAGE lexical-content byte ceiling, overridable via
-/// `CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES` (#290).
-///
-/// It bounds one message (a pasted image/base64 blob), never a conversation:
-/// a cumulative per-conversation cap blanked every message past a long
-/// session's first 8 MiB, which on the owner's archive was 39.6% of its
-/// messages (bgn6s). Long conversations are instead read in bounded chunks.
-/// `0` is rejected (treated as "use default").
-pub fn lexical_max_message_content_bytes() -> usize {
-    dotenvy::var("CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(LEXICAL_MAX_MESSAGE_CONTENT_BYTES_DEFAULT)
-}
-
-/// Largest byte length `<= cap` that ends on a UTF-8 char boundary of `content`.
-fn lexical_content_truncation_boundary(content: &str, cap: usize) -> usize {
-    if content.len() <= cap {
-        return content.len();
-    }
-    let mut boundary = cap;
-    while boundary > 0 && !content.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    boundary
-}
-
 /// Marker error a lexical-rebuild row callback raises to stop a stream early;
 /// never surfaced to callers.
 const LEXICAL_REBUILD_STREAM_STOPPED: &str = "cass lexical rebuild stream stopped by caller";
 
+/// Which rows [`FrankenStorage::lexical_chunk_overlaps`] looks at.
+pub(crate) enum LexicalOverlapScope {
+    Conversation {
+        conversation_id: i64,
+        idx_range: Option<(i64, i64)>,
+    },
+    /// Rows with `after < id <= through`.
+    MessageIds { after: i64, through: i64 },
+}
+
+/// Message ids per window of [`FrankenStorage::for_each_lexical_rebuild_message_after_id`],
+/// so the overlaps it holds at once stay bounded however many rows follow.
+const LEXICAL_AFTER_ID_WINDOW: i64 = 65_536;
+
+/// Put the overlap from the chunk before `message` in front of its text.
+fn with_lexical_overlap(message: &mut Message, tail: Option<&String>) {
+    if let Some(tail) = tail {
+        message.content = crate::search::chunk_overlap::lexical_text(Some(tail), &message.content);
+    }
+}
+
 /// One lexical-rebuild projection row (`id, idx, role, author, created_at,
-/// capped content, source byte length`) as a [`Message`] whose text is bounded
-/// by `cap` bytes on a UTF-8 boundary (#290).
+/// content, source byte length`) as a [`Message`], with its whole text.
 fn lexical_rebuild_message_from_row(
     row: &FrankenRow,
-    cap: usize,
 ) -> std::result::Result<Message, crate::franken_sync::FrankenError> {
     let role: String = row.get_typed(2)?;
-    let mut content: String = row.get_typed(5)?;
-    let boundary = lexical_content_truncation_boundary(&content, cap);
-    if boundary < content.len() {
-        // GH #466: truncate would retain the projected cell's whole allocation.
-        content = content[..boundary].to_owned();
-    }
+    let content: String = row.get_typed(5)?;
     Ok(Message {
         id: Some(row.get_typed(0)?),
         idx: row.get_typed(1)?,
@@ -4967,17 +4946,6 @@ fn lexical_rebuild_message_from_row(
         extra_json: serde_json::Value::Null,
         snippets: Vec::new(),
     })
-}
-
-/// Cap each message's lexical content at `cap` bytes on a UTF-8 char boundary
-/// (#290), independently of every other message. Test mirror of the per-row
-/// bound the rebuild fetch applies; message rows are always preserved.
-#[cfg(test)]
-fn truncate_lexical_rebuild_message_content(messages: &mut [Message], cap: usize) {
-    for message in messages.iter_mut() {
-        let boundary = lexical_content_truncation_boundary(&message.content, cap);
-        message.content.truncate(boundary);
-    }
 }
 
 /// Compatibility alias retained while call sites finish converging on `FrankenStorage`.
@@ -12063,10 +12031,10 @@ impl FrankenStorage {
     /// `extra_json` here prevents rebuilds from rehydrating enormous historical
     /// payloads that are irrelevant to lexical search.
     ///
-    /// Each message's indexed text is capped at
-    /// [`lexical_max_message_content_bytes`] (#290: one pasted image/base64
-    /// blob). Every message keeps its own text however long the conversation is
-    /// (bgn6s); a caller that must bound memory for a long conversation reads it
+    /// Each message keeps its whole text, after the overlap from the chunk
+    /// before it when it continues a split message
+    /// ([`crate::search::chunk_overlap`]). Every message keeps its own text
+    /// however long the conversation is (bgn6s); a caller that must bound memory for a long conversation reads it
     /// in index ranges ([`Self::lexical_rebuild_message_footprints`],
     /// [`Self::fetch_messages_for_lexical_rebuild_idx_range`]) or stops early
     /// ([`Self::fetch_messages_for_lexical_rebuild_within`]).
@@ -12121,8 +12089,137 @@ impl FrankenStorage {
         Ok(messages)
     }
 
+    /// The overlap text (see [`crate::search::chunk_overlap`]) for every row in
+    /// `scope` that continues a split message, keyed by `(conversation_id,
+    /// idx)`. Only a row right after a full-size row can continue one, so a
+    /// conversation without such rows costs one indexed query; each candidate
+    /// is then checked against both rows' chunk records.
+    pub(crate) fn lexical_chunk_overlaps(
+        &self,
+        scope: &LexicalOverlapScope,
+    ) -> Result<HashMap<(i64, i64), String>> {
+        // A chunk other than the last is cut at a char boundary at most 3
+        // bytes short of the chunk size.
+        let full = i64::try_from(franken_agent_detection::MESSAGE_CHUNK_BYTES.saturating_sub(3))
+            .unwrap_or(i64::MAX);
+        // For one conversation the join is driven from the predecessor `p`:
+        // full-size rows are rare, so only they cost an index lookup for the
+        // row after them. For an id window it is driven from the window's
+        // rows `m`, whose predecessor may lie before the window.
+        let from_predecessor = "SELECT m.conversation_id, m.idx FROM messages p \
+             CROSS JOIN messages m ON m.conversation_id = p.conversation_id AND m.idx = p.idx + 1 \
+             WHERE COALESCE(octet_length(p.content), 0) >= ?1";
+        let (sql, params) = match *scope {
+            LexicalOverlapScope::Conversation {
+                conversation_id,
+                idx_range: None,
+            } => (
+                format!("{from_predecessor} AND p.conversation_id = ?2"),
+                vec![ParamValue::from(full), ParamValue::from(conversation_id)],
+            ),
+            LexicalOverlapScope::Conversation {
+                conversation_id,
+                idx_range: Some((first_idx, last_idx)),
+            } => (
+                format!("{from_predecessor} AND p.conversation_id = ?2 AND p.idx >= ?3 AND p.idx <= ?4"),
+                vec![
+                    ParamValue::from(full),
+                    ParamValue::from(conversation_id),
+                    ParamValue::from(first_idx.saturating_sub(1)),
+                    ParamValue::from(last_idx.saturating_sub(1)),
+                ],
+            ),
+            LexicalOverlapScope::MessageIds { after, through } => (
+                "SELECT m.conversation_id, m.idx FROM messages m \
+                 CROSS JOIN messages p ON p.conversation_id = m.conversation_id AND p.idx = m.idx - 1 \
+                 WHERE m.id > ?2 AND m.id <= ?3 AND COALESCE(octet_length(p.content), 0) >= ?1"
+                    .to_string(),
+                vec![
+                    ParamValue::from(full),
+                    ParamValue::from(after),
+                    ParamValue::from(through),
+                ],
+            ),
+        };
+        let candidates: Vec<(i64, i64)> = self
+            .conn
+            .query_map_collect(&sql, &params, |row| {
+                Ok((row.get_typed(0)?, row.get_typed(1)?))
+            })
+            .context("finding rows that may continue a split message")?;
+        let mut overlaps = HashMap::new();
+        for (conversation_id, idx) in candidates {
+            let rows = self
+                .conn
+                .query_map_collect(
+                    "SELECT idx, CASE WHEN idx = ?2 THEN content END, extra_json, extra_bin \
+                     FROM messages WHERE conversation_id = ?1 AND idx >= ?2 AND idx <= ?3 \
+                     ORDER BY idx",
+                    fparams![conversation_id, idx - 1, idx],
+                    |row| {
+                        Ok((
+                            row.get_typed::<Option<String>>(1)?,
+                            franken_read_message_extra_compat(row, 2, 3),
+                        ))
+                    },
+                )
+                .with_context(|| {
+                    format!("reading chunk neighbours {idx} of conversation {conversation_id}")
+                })?;
+            let [(Some(prev_content), prev_extra), (_, cur_extra)] = rows.as_slice() else {
+                continue;
+            };
+            if crate::search::chunk_overlap::chunk_follows(prev_extra, cur_extra) {
+                let tail = crate::search::chunk_overlap::overlap_tail(prev_content);
+                if !tail.is_empty() {
+                    overlaps.insert((conversation_id, idx), tail.to_owned());
+                }
+            } else if crate::search::chunk_overlap::continues_chunk(cur_extra) {
+                tracing::warn!(
+                    conversation_id,
+                    idx,
+                    "chunk row does not follow the row before it; indexing it without overlap"
+                );
+            }
+        }
+        Ok(overlaps)
+    }
+
+    /// Which of `indices` in a conversation hold a chunk that continues a
+    /// split message (ordinal above 0), read from their chunk records.
+    pub(crate) fn lexical_chunk_continuations(
+        &self,
+        conversation_id: i64,
+        indices: &[i64],
+    ) -> Result<Vec<i64>> {
+        if indices.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; indices.len()].join(", ");
+        let sql = format!(
+            "SELECT idx, extra_json, extra_bin FROM messages \
+             WHERE conversation_id = ? AND idx IN ({placeholders}) ORDER BY idx"
+        );
+        let mut params = vec![ParamValue::from(conversation_id)];
+        params.extend(indices.iter().copied().map(ParamValue::from));
+        let rows: Vec<(i64, serde_json::Value)> = self
+            .conn
+            .query_map_collect(&sql, &params, |row| {
+                Ok((
+                    row.get_typed(0)?,
+                    franken_read_message_extra_compat(row, 1, 2),
+                ))
+            })
+            .with_context(|| format!("reading chunk records of conversation {conversation_id}"))?;
+        Ok(rows
+            .into_iter()
+            .filter(|(_, extra)| crate::search::chunk_overlap::continues_chunk(extra))
+            .map(|(idx, _)| idx)
+            .collect())
+    }
+
     /// Every message with `id > after_message_id`, as `(conversation_id,
-    /// message)` in id order, each capped as in
+    /// message)` in id order, each read as in
     /// [`Self::fetch_messages_for_lexical_rebuild`]: a rowid-range scan that
     /// reads only rows appended after a memo, never the older text of the
     /// conversations they belong to.
@@ -12134,44 +12231,61 @@ impl FrankenStorage {
     where
         F: FnMut(i64, Message) -> Result<()>,
     {
-        let cap = lexical_max_message_content_bytes().min(i32::MAX as usize);
-        let sql = format!(
-            "SELECT id, idx, role, author, created_at, \
-                 substr(content, 1, {cap}), COALESCE(octet_length(content), 0), conversation_id \
-                 FROM messages WHERE id > ?1 ORDER BY id"
-        );
-        let mut callback_error = None;
-        let outcome = self.conn.query_with_params_for_each(
-            &sql,
-            &[SqliteValue::from(after_message_id)],
-            |row| {
-                let conversation_id: i64 = row.get_typed(7)?;
-                let message = lexical_rebuild_message_from_row(row, cap)?;
-                if let Err(err) = f(conversation_id, message) {
-                    callback_error = Some(err);
-                    return Err(crate::franken_sync::FrankenError::Internal(
-                        LEXICAL_REBUILD_STREAM_STOPPED.to_string(),
-                    ));
-                }
-                Ok(())
-            },
-        );
-        if let Some(err) = callback_error {
-            return Err(err);
+        let max_id: i64 = self
+            .conn
+            .query_row_map(
+                "SELECT COALESCE(MAX(id), 0) FROM messages",
+                &[] as &[ParamValue],
+                |row| row.get_typed(0),
+            )
+            .context("reading the max message id for a lexical append scan")?;
+        let sql = "SELECT id, idx, role, author, created_at, \
+                 content, COALESCE(octet_length(content), 0), conversation_id \
+                 FROM messages WHERE id > ?1 AND id <= ?2 ORDER BY id";
+        let mut after = after_message_id;
+        while after < max_id {
+            let through = after.saturating_add(LEXICAL_AFTER_ID_WINDOW).min(max_id);
+            let overlaps =
+                self.lexical_chunk_overlaps(&LexicalOverlapScope::MessageIds { after, through })?;
+            let mut callback_error = None;
+            let outcome = self.conn.query_with_params_for_each(
+                sql,
+                &[SqliteValue::from(after), SqliteValue::from(through)],
+                |row| {
+                    let conversation_id: i64 = row.get_typed(7)?;
+                    let mut message = lexical_rebuild_message_from_row(row)?;
+                    let tail = overlaps.get(&(conversation_id, message.idx));
+                    with_lexical_overlap(&mut message, tail);
+                    if let Err(err) = f(conversation_id, message) {
+                        callback_error = Some(err);
+                        return Err(crate::franken_sync::FrankenError::Internal(
+                            LEXICAL_REBUILD_STREAM_STOPPED.to_string(),
+                        ));
+                    }
+                    Ok(())
+                },
+            );
+            if let Some(err) = callback_error {
+                return Err(err);
+            }
+            outcome.with_context(|| {
+                format!("streaming lexical messages appended after message id {after_message_id}")
+            })?;
+            after = through;
         }
-        outcome.with_context(|| {
-            format!("streaming lexical messages appended after message id {after_message_id}")
-        })
+        Ok(())
     }
 
     /// `(idx, indexed text bytes)` for every message of a conversation in
     /// `idx` order, read from record metadata without the text itself: the
-    /// input for splitting a long conversation into bounded chunks.
+    /// input for splitting a long conversation into bounded chunks. A row
+    /// right after a full-size row may continue a split message, so it also
+    /// counts the longest overlap it can carry.
     pub fn lexical_rebuild_message_footprints(
         &self,
         conversation_id: i64,
     ) -> Result<Vec<(i64, usize)>> {
-        let cap = lexical_max_message_content_bytes().min(i32::MAX as usize);
+        let full = franken_agent_detection::MESSAGE_CHUNK_BYTES.saturating_sub(3);
         let sql = |hinted: bool| {
             format!(
                 "SELECT idx, COALESCE(octet_length(content), 0) FROM messages{} \
@@ -12186,12 +12300,22 @@ impl FrankenStorage {
         let params = [SqliteValue::from(conversation_id)];
         let read = |sql: &str| -> Result<Vec<(i64, usize)>> {
             let mut footprints = Vec::new();
+            let mut previous: Option<(i64, usize)> = None;
             self.conn
                 .query_with_params_for_each(sql, &params, |row| {
-                    let bytes = usize::try_from(row.get_typed::<i64>(1)?.max(0))
-                        .unwrap_or(usize::MAX)
-                        .min(cap);
-                    footprints.push((row.get_typed::<i64>(0)?, bytes));
+                    let idx = row.get_typed::<i64>(0)?;
+                    let stored =
+                        usize::try_from(row.get_typed::<i64>(1)?.max(0)).unwrap_or(usize::MAX);
+                    let overlap = match previous {
+                        Some((prev_idx, prev_bytes))
+                            if prev_idx + 1 == idx && prev_bytes >= full =>
+                        {
+                            crate::search::chunk_overlap::MAX_OVERLAP_BYTES
+                        }
+                        _ => 0,
+                    };
+                    previous = Some((idx, stored));
+                    footprints.push((idx, stored.saturating_add(overlap)));
                     Ok(())
                 })
                 .with_context(|| {
@@ -12209,12 +12333,10 @@ impl FrankenStorage {
 
     /// Stream a conversation's lexical projections (optionally one inclusive
     /// `idx` range) through FrankenSQLite's row callback instead of collecting
-    /// the complete result. SQL bounds each projected text cell by `cap`
-    /// Unicode scalar values and the callback applies the stricter per-message
-    /// UTF-8 byte cap before handing the row on. `f` returns `false` to stop
-    /// early; the return value says whether every row was visited.
-    /// FrankenSQLite can still transiently materialize a full non-ASCII source
-    /// cell until upstream issue #400 is fixed.
+    /// the complete result. Each message carries its whole text, with the
+    /// chunk overlap in front where it continues a split message. `f` returns
+    /// `false` to stop early; the return value says whether every row was
+    /// visited.
     pub(crate) fn for_each_lexical_rebuild_message<F>(
         &self,
         conversation_id: i64,
@@ -12224,11 +12346,10 @@ impl FrankenStorage {
     where
         F: FnMut(Message) -> Result<bool>,
     {
-        // FrankenSQLite's allocation-avoiding ASCII ColumnSubstrPrefix path
-        // requires a literal signed-32-bit prefix length. This value is parsed
-        // from our own numeric cap, never from SQL/user text, so embedding it
-        // cannot introduce SQL injection.
-        let cap = lexical_max_message_content_bytes().min(i32::MAX as usize);
+        let overlaps = self.lexical_chunk_overlaps(&LexicalOverlapScope::Conversation {
+            conversation_id,
+            idx_range,
+        })?;
         let range_clause = if idx_range.is_some() {
             " AND idx >= ?2 AND idx <= ?3"
         } else {
@@ -12237,7 +12358,7 @@ impl FrankenStorage {
         let sql = |hinted: bool| {
             format!(
                 "SELECT id, idx, role, author, created_at, \
-                     substr(content, 1, {cap}), COALESCE(octet_length(content), 0) \
+                     content, COALESCE(octet_length(content), 0) \
                      FROM messages{} \
                      WHERE conversation_id = ?1{range_clause} ORDER BY idx",
                 if hinted {
@@ -12256,7 +12377,9 @@ impl FrankenStorage {
             let mut stopped = false;
             let mut callback_error = None;
             let outcome = self.conn.query_with_params_for_each(sql, &params, |row| {
-                let message = lexical_rebuild_message_from_row(row, cap)?;
+                let mut message = lexical_rebuild_message_from_row(row)?;
+                let tail = overlaps.get(&(conversation_id, message.idx));
+                with_lexical_overlap(&mut message, tail);
                 match f(message) {
                     Ok(true) => Ok(()),
                     Ok(false) => {
@@ -26537,112 +26660,13 @@ mod tests {
 
     /// bgn6s: the cap bounds each message, never the conversation. A cumulative
     /// cap (the old behavior) cleared every message after the first 100 bytes.
+    /// bgn6s and step 6: every message of a long conversation keeps its whole
+    /// text, and the footprint / range / budgeted reads let callers bound
+    /// memory instead.
     #[test]
-    fn lexical_content_truncation_caps_each_message_and_keeps_later_text() {
-        use crate::model::types::{Message, MessageRole};
-
-        let cap = 50usize;
-        let mut messages = vec![
-            Message {
-                id: Some(1),
-                idx: 0,
-                role: MessageRole::User,
-                author: None,
-                created_at: Some(1),
-                content: "a".repeat(60),
-                extra_json: serde_json::Value::Null,
-                snippets: Vec::new(),
-            },
-            Message {
-                id: Some(2),
-                idx: 1,
-                role: MessageRole::Agent,
-                author: None,
-                created_at: Some(2),
-                content: "b".repeat(60),
-                extra_json: serde_json::Value::Null,
-                snippets: Vec::new(),
-            },
-            Message {
-                id: Some(3),
-                idx: 2,
-                role: MessageRole::Agent,
-                author: None,
-                created_at: Some(3),
-                content: "c".repeat(60),
-                extra_json: serde_json::Value::Null,
-                snippets: Vec::new(),
-            },
-        ];
-
-        truncate_lexical_rebuild_message_content(&mut messages, cap);
-
-        // Structure (message count + ids) preserved; only indexed text trimmed.
-        assert_eq!(messages.len(), 3, "message rows must be preserved");
-        assert_eq!(
-            messages.iter().map(|m| m.id).collect::<Vec<_>>(),
-            vec![Some(1), Some(2), Some(3)]
-        );
-        // Every message keeps its own capped prefix; the last one included.
-        for (message, letter) in messages.iter().zip(["a", "b", "c"]) {
-            assert_eq!(message.content, letter.repeat(cap));
-        }
-    }
-
-    #[test]
-    fn lexical_content_truncation_is_noop_within_cap() {
-        use crate::model::types::{Message, MessageRole};
-
-        let mut messages = vec![Message {
-            id: Some(1),
-            idx: 0,
-            role: MessageRole::User,
-            author: None,
-            created_at: Some(1),
-            content: "short".to_string(),
-            extra_json: serde_json::Value::Null,
-            snippets: Vec::new(),
-        }];
-        truncate_lexical_rebuild_message_content(&mut messages, 1024);
-        assert_eq!(messages[0].content, "short", "within-cap content untouched");
-    }
-
-    #[test]
-    fn lexical_content_truncation_respects_utf8_char_boundaries() {
-        use crate::model::types::{Message, MessageRole};
-
-        // Each "é" is 2 bytes; a cap of 5 must not split a code point.
-        let mut messages = vec![Message {
-            id: Some(1),
-            idx: 0,
-            role: MessageRole::User,
-            author: None,
-            created_at: Some(1),
-            content: "ééé".to_string(), // 6 bytes
-            extra_json: serde_json::Value::Null,
-            snippets: Vec::new(),
-        }];
-        truncate_lexical_rebuild_message_content(&mut messages, 5);
-        // Largest char boundary <= 5 is 4 bytes ("éé").
-        assert_eq!(messages[0].content, "éé");
-        assert!(
-            messages[0]
-                .content
-                .is_char_boundary(messages[0].content.len())
-        );
-    }
-
-    /// #290 + bgn6s: oversized messages are capped one by one; no message of a
-    /// long conversation loses its text to a conversation-wide budget, and the
-    /// footprint / range / budgeted reads let callers bound memory instead.
-    #[test]
-    #[serial]
-    fn fetch_messages_for_lexical_rebuild_caps_each_message_of_a_long_conversation() {
+    fn fetch_messages_for_lexical_rebuild_keeps_each_message_of_a_long_conversation_whole() {
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
         use std::path::PathBuf;
-
-        // Force a small, deterministic per-message cap independent of host memory.
-        let _cap = set_env_var("CASS_LEXICAL_MAX_MESSAGE_CONTENT_BYTES", "1025");
 
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("agent_search.db");
@@ -26699,28 +26723,21 @@ mod tests {
             )
             .unwrap();
 
-        let projection_opcodes: Vec<String> = storage
+        let footprint_opcodes: Vec<String> = storage
             .conn
             .query_map_collect(
-                "EXPLAIN SELECT id, idx, role, author, created_at, \
-                     substr(content, 1, 1025), COALESCE(octet_length(content), 0) \
+                "EXPLAIN SELECT idx, COALESCE(octet_length(content), 0) \
                      FROM messages INDEXED BY sqlite_autoindex_messages_1 \
                      WHERE conversation_id = ?1 ORDER BY idx",
                 fparams![conversation_id],
                 |row| row.get_typed(1),
             )
-            .expect("explain bounded lexical projection");
+            .expect("explain footprint projection");
         assert!(
-            projection_opcodes
-                .iter()
-                .any(|opcode| opcode == "ColumnSubstrPrefix"),
-            "literal prefix cap must compile to the bounded column projection opcode: {projection_opcodes:?}"
-        );
-        assert!(
-            projection_opcodes
+            footprint_opcodes
                 .iter()
                 .any(|opcode| opcode == "ColumnOctetLength"),
-            "source byte length must come from record metadata without hydrating the full cell: {projection_opcodes:?}"
+            "source byte length must come from record metadata without hydrating the full cell: {footprint_opcodes:?}"
         );
 
         let messages = storage
@@ -26733,27 +26750,19 @@ mod tests {
             MESSAGE_COUNT as usize,
             "message rows preserved"
         );
-        // ... and EVERY message keeps its own capped prefix (bgn6s): a 1,025-byte
-        // cap cannot split a two-byte `é`, so each keeps 1,024 bytes. The old
-        // cumulative cap kept only the first message and blanked the other 63.
+        // ... and EVERY message keeps its whole text (bgn6s, step 6).
         assert!(
-            messages.iter().all(|message| message.content.len() == 1024),
-            "each message is capped on its own UTF-8 boundary"
-        );
-        assert!(
-            messages
-                .iter()
-                .all(|message| message.content.capacity() <= 1025),
-            "a retained prefix never keeps the full projected cell allocation"
+            messages.iter().all(|message| message.content == big),
+            "each message keeps its whole text"
         );
         assert!(messages.iter().all(|message| message.extra_json.is_null()));
 
-        // Footprints report each message's capped size without reading text.
+        // Footprints report each message's size without reading text.
         let footprints = storage
             .lexical_rebuild_message_footprints(conversation_id)
             .unwrap();
         assert_eq!(footprints.len(), MESSAGE_COUNT as usize);
-        assert!(footprints.iter().all(|(_, bytes)| *bytes == 1025));
+        assert!(footprints.iter().all(|(_, bytes)| *bytes == big.len()));
         assert_eq!(
             footprints.iter().map(|(idx, _)| *idx).collect::<Vec<_>>(),
             (0..MESSAGE_COUNT).collect::<Vec<_>>()
@@ -26766,19 +26775,19 @@ mod tests {
             range.iter().map(|message| message.idx).collect::<Vec<_>>(),
             vec![10, 11, 12]
         );
-        assert!(range.iter().all(|message| message.content.len() == 1024));
+        assert!(range.iter().all(|message| message.content == big));
         // A byte budget stops the read before the whole conversation is held.
         assert!(
             storage
                 .fetch_messages_for_lexical_rebuild_within(conversation_id, 5 * 1024)
                 .unwrap()
                 .is_none(),
-            "64 KiB of text does not fit a 5 KiB budget"
+            "128 KiB of text does not fit a 5 KiB budget"
         );
         let within = storage
-            .fetch_messages_for_lexical_rebuild_within(conversation_id, 64 * 1024)
+            .fetch_messages_for_lexical_rebuild_within(conversation_id, 128 * 1024)
             .unwrap()
-            .expect("the whole conversation fits a 64 KiB budget");
+            .expect("the whole conversation fits a 128 KiB budget");
         assert_eq!(within.len(), MESSAGE_COUNT as usize);
         let stored = storage.fetch_messages(conversation_id).unwrap();
         assert_eq!(stored.len(), MESSAGE_COUNT as usize);
@@ -26795,6 +26804,137 @@ mod tests {
         );
         assert!(stored.iter().all(|message| message.content == big));
         assert!(stored.iter().all(|message| !message.extra_json.is_null()));
+    }
+
+    /// Step 6: every lexical reader puts the tail of chunk k in front of chunk
+    /// k+1 of the same split message, and only there.
+    #[test]
+    fn lexical_readers_put_the_previous_chunk_tail_before_a_continuation_chunk() {
+        use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
+        use crate::search::chunk_overlap::{MAX_OVERLAP_BYTES, overlap_tail};
+        use franken_agent_detection::{MESSAGE_CHUNK_BYTES, MESSAGE_CHUNK_KEY};
+        use std::path::PathBuf;
+
+        let dir = TempDir::new().unwrap();
+        let storage = SqliteStorage::open(&dir.path().join("agent_search.db")).unwrap();
+        let agent_id = storage
+            .ensure_agent(&Agent {
+                id: None,
+                slug: "claude_code".into(),
+                name: "Claude Code".into(),
+                version: None,
+                kind: AgentKind::Cli,
+            })
+            .unwrap();
+
+        // Chunk 0 is a full chunk; chunk 1 ends the message. A second full-size
+        // message of another group follows, then an ordinary reply.
+        let first = "word ".repeat(MESSAGE_CHUNK_BYTES / 5) + "tail";
+        let first = first[..MESSAGE_CHUNK_BYTES].to_string();
+        let second = "continues here".to_string();
+        let total = (first.len() + second.len()) as u64;
+        let chunk = |group: &str, ordinal: u64, start: usize, end: usize| {
+            serde_json::json!({MESSAGE_CHUNK_KEY: {
+                "group": group, "ordinal": ordinal, "byte_start": start,
+                "byte_end": end, "total_bytes": total,
+            }})
+        };
+        let message = |idx: i64, content: String, extra_json: serde_json::Value| Message {
+            id: None,
+            idx,
+            role: MessageRole::Agent,
+            author: None,
+            created_at: Some(1_700_000_000_000 + idx),
+            content,
+            extra_json,
+            snippets: Vec::new(),
+        };
+        let conversation = Conversation {
+            id: None,
+            agent_slug: "claude_code".into(),
+            workspace: Some(PathBuf::from("/tmp/workspace")),
+            external_id: Some("conv-chunks".into()),
+            title: Some("Chunks".into()),
+            source_path: PathBuf::from("/tmp/conv-chunks.jsonl"),
+            started_at: Some(1_700_000_000_000),
+            ended_at: Some(1_700_000_000_100),
+            approx_tokens: None,
+            metadata_json: serde_json::Value::Null,
+            messages: vec![
+                message(0, first.clone(), chunk("g", 0, 0, first.len())),
+                message(
+                    1,
+                    second.clone(),
+                    chunk("g", 1, first.len(), total as usize),
+                ),
+                message(2, first.clone(), chunk("h", 0, 0, first.len())),
+                message(3, "an ordinary reply".into(), serde_json::Value::Null),
+            ],
+            source_id: LOCAL_SOURCE_ID.into(),
+            origin_host: None,
+        };
+        storage
+            .insert_conversation_tree(agent_id, None, &conversation)
+            .unwrap();
+        let conversation_id = storage
+            .conn
+            .query_row_map(
+                "SELECT id FROM conversations WHERE external_id = ?1",
+                fparams!["conv-chunks"],
+                |row| row.get_typed::<i64>(0),
+            )
+            .unwrap();
+
+        let expected = format!("{}{second}", overlap_tail(&first));
+        let contents = |messages: &[Message]| -> Vec<String> {
+            messages
+                .iter()
+                .map(|message| message.content.clone())
+                .collect()
+        };
+        let whole = storage
+            .fetch_messages_for_lexical_rebuild(conversation_id)
+            .unwrap();
+        assert_eq!(
+            contents(&whole),
+            vec![
+                first.clone(),
+                expected.clone(),
+                first.clone(),
+                "an ordinary reply".to_string()
+            ],
+            "only the row that follows its own chunk gets the overlap"
+        );
+        // A range that starts at the continuation still reads the chunk before it.
+        let range = storage
+            .fetch_messages_for_lexical_rebuild_idx_range(conversation_id, 1, 1)
+            .unwrap();
+        assert_eq!(contents(&range), vec![expected.clone()]);
+        // The id-ordered reader of a resumed rebuild does the same.
+        let first_id = whole[0].id.unwrap();
+        let mut after = Vec::new();
+        storage
+            .for_each_lexical_rebuild_message_after_id(first_id, |_, message| {
+                after.push(message);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(after[0].content, expected);
+        assert_eq!(after.len(), 3);
+        // Footprints count the overlap a row after a full-size row may carry.
+        let footprints = storage
+            .lexical_rebuild_message_footprints(conversation_id)
+            .unwrap();
+        assert_eq!(
+            footprints,
+            vec![
+                (0, first.len()),
+                (1, second.len() + MAX_OVERLAP_BYTES),
+                (2, first.len()),
+                (3, "an ordinary reply".len() + MAX_OVERLAP_BYTES),
+            ]
+        );
+        assert!(footprints[1].1 >= expected.len());
     }
 
     #[test]
