@@ -127,18 +127,19 @@ fn a_long_tool_output_kept_whole_by_fad_still_certifies_its_rollout() -> Result<
 }
 
 #[test]
-fn a_rollout_whose_kept_tool_output_was_cut_is_delivered_but_never_certified() -> Result<()> {
+fn a_rollout_whose_enrichment_adds_a_chunked_output_is_certified() -> Result<()> {
     let (_root, paths, ctx) = corpus("jsonl")?;
+    let text = "z".repeat(franken_agent_detection::MESSAGE_CHUNK_BYTES + 10);
     let output = serde_json::json!({
         "type": "response_item",
         "payload": {
             "type": "function_call_output",
             "call_id": "call-1",
-            "output": "z".repeat(200_000),
+            "output": text,
         },
     });
     fs::write(&paths[1], format!("{output}\n"))?;
-    let mut delivered = Vec::new();
+    let mut chunks = 0;
     let mut completed = Vec::new();
     let mut complete = |done: &SourceCompletion| {
         completed.push(done.source.source_path.clone());
@@ -149,13 +150,15 @@ fn a_rollout_whose_kept_tool_output_was_cut_is_delivered_but_never_certified() -
         on_source_complete: Some(&mut complete),
         tail_resume: None,
     };
-    // Drop FAD's whole copy so the real enrichment pass keeps its cut one.
+    // Drop FAD's chunks so the real enrichment pass adds its own.
     scan(
         &franken_agent_detection::CodexConnector::new(),
         &ctx,
         &mut hooks,
         &mut |conversation| {
-            delivered.push(conversation.source_path);
+            if conversation.source_path == paths[1] {
+                chunks = conversation.messages.len();
+            }
             Ok(())
         },
         |conversation| {
@@ -165,11 +168,10 @@ fn a_rollout_whose_kept_tool_output_was_cut_is_delivered_but_never_certified() -
             super::super::augment_modern_codex_messages(conversation, None)
         },
     )?;
-    assert_eq!(delivered, paths, "every rollout is still delivered");
+    assert_eq!(chunks, 2, "the output is added whole, in two chunks");
     assert_eq!(
-        completed,
-        [paths[0].clone(), paths[2].clone()],
-        "the rollout with cut text is not certified complete"
+        completed, paths,
+        "nothing was cut, so every rollout completes"
     );
     Ok(())
 }

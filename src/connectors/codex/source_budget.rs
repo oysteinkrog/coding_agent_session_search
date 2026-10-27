@@ -404,7 +404,6 @@ fn scan_with_admission(
         state
             .borrow()
             .validate_current_source(&conversation.source_path)?;
-        super::take_cut_tool_outputs();
         let enriched = enrich(&mut conversation).or_else(|error| {
             let state = state.borrow();
             let snapshot = state
@@ -441,17 +440,6 @@ fn scan_with_admission(
         state
             .borrow()
             .validate_current_source(&conversation.source_path)?;
-        let cut = super::take_cut_tool_outputs();
-        if cut > 0 {
-            // Text was cut to fit a size limit: deliver what was kept, but
-            // never certify the source, so a later build parses it again.
-            tracing::warn!(
-                path = %conversation.source_path.display(),
-                cut_tool_outputs = cut,
-                "codex source indexed with tool output cut; completion withheld"
-            );
-            state.borrow_mut().withheld_source = Some(conversation.source_path.clone());
-        }
         // Deliberately outside the enrichment error match: sink/storage errors
         // must abort even when a caller returns the same concrete error type.
         let source_path = conversation.source_path.clone();

@@ -18,21 +18,6 @@ use super::{
     ScanContext, parse_timestamp, reindex_messages,
 };
 
-const MAX_INDEXED_TOOL_OUTPUT_CHARS: usize = 128 * 1024;
-
-thread_local! {
-    /// Tool outputs cut on this thread since the last `take_cut_tool_outputs`.
-    /// After an enrichment pass it holds only the cuts in messages that pass
-    /// kept; the source budget reads it so a source with cut text is never
-    /// certified complete.
-    static CUT_TOOL_OUTPUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// How many tool outputs were cut since the last call, resetting the count.
-fn take_cut_tool_outputs() -> usize {
-    CUT_TOOL_OUTPUTS.with(|cut| cut.replace(0))
-}
-
 pub struct CodexConnector {
     inner: franken_agent_detection::CodexConnector,
 }
@@ -212,17 +197,21 @@ fn augment_modern_codex_reader(
     progress_tick: Option<&(dyn Fn() + Send + Sync)>,
     reader: &mut impl BufRead,
 ) -> Result<u64> {
+    // A continuation chunk of a split message is no record of its own: only
+    // chunk 0 stands for the message in these indices.
     let mut message_indices_by_signature: HashMap<ModernCodexMessageSignature, usize> =
         conversation
             .messages
             .iter()
             .enumerate()
+            .filter(|(_, message)| !is_continuation_chunk(message))
             .map(|(index, message)| (modern_codex_message_signature(message), index))
             .collect();
     let mut message_indices_by_call_id: HashMap<String, usize> = conversation
         .messages
         .iter()
         .enumerate()
+        .filter(|(_, message)| !is_continuation_chunk(message))
         .flat_map(|(index, message)| {
             modern_codex_message_call_ids(message).map(move |call_id| (call_id, index))
         })
@@ -231,12 +220,10 @@ fn augment_modern_codex_reader(
         .messages
         .iter()
         .enumerate()
+        .filter(|(_, message)| !is_continuation_chunk(message))
         .map(|(index, message)| (modern_codex_raw_signature(&message.extra), index))
         .collect();
     let mut added = false;
-    // Cuts in messages this pass keeps. A cut in a candidate that matches a
-    // message FAD already stored whole is discarded with the candidate.
-    let mut kept_cuts = 0_usize;
     let mut line = String::new();
     let mut bytes_read = 0_u64;
     let mut line_no = 0_usize;
@@ -289,10 +276,7 @@ fn augment_modern_codex_reader(
             }
         };
         let raw_signature = modern_codex_raw_signature(&raw);
-        take_cut_tool_outputs();
-        let message = modern_codex_message(&raw);
-        let cut = take_cut_tool_outputs();
-        let Some(message) = message else {
+        let Some(message) = modern_codex_message(&raw) else {
             continue;
         };
         let message_signature = modern_codex_message_signature(&message);
@@ -314,8 +298,9 @@ fn augment_modern_codex_reader(
 
         if let Some(existing_index) = existing_index {
             let existing = &mut conversation.messages[existing_index];
-            if merge_modern_codex_tool_call(existing, &message) {
-                kept_cuts = kept_cuts.saturating_add(cut);
+            // A split message keeps FAD's chunks; merging whole text into
+            // chunk 0 would store it twice.
+            if !is_chunk(existing) && merge_modern_codex_tool_call(existing, &message) {
                 message_indices_by_signature
                     .insert(modern_codex_message_signature(existing), existing_index);
                 message_indices_by_call_id.extend(
@@ -327,9 +312,12 @@ fn augment_modern_codex_reader(
             continue;
         }
 
-        kept_cuts = kept_cuts.saturating_add(cut);
         let message_index = conversation.messages.len();
-        conversation.messages.push(message);
+        // A message over the chunk size is added as ordered chunks, with
+        // chunk 0 standing for it in the indices.
+        conversation
+            .messages
+            .extend(franken_agent_detection::chunk_message(message));
         let stored = &conversation.messages[message_index];
         message_indices_by_signature.insert(message_signature, message_index);
         message_indices_by_call_id
@@ -346,7 +334,6 @@ fn augment_modern_codex_reader(
         });
         reindex_messages(&mut conversation.messages);
     }
-    CUT_TOOL_OUTPUTS.with(|count| count.set(count.get().saturating_add(kept_cuts)));
     Ok(bytes_read)
 }
 
@@ -608,7 +595,7 @@ fn tool_output_content(call_id: Option<&str>, output: &str) -> String {
         || "[Tool output]".to_string(),
         |id| format!("[Tool output: {id}]"),
     );
-    let output = truncate_tool_output(output.trim());
+    let output = output.trim();
     if output.is_empty() {
         label
     } else {
@@ -634,26 +621,6 @@ fn normalize_invocation_arguments(arguments: Value) -> Option<Value> {
     }
 }
 
-fn truncate_tool_output(output: &str) -> String {
-    let mut truncated = String::new();
-    let mut chars = output.chars();
-    for _ in 0..MAX_INDEXED_TOOL_OUTPUT_CHARS {
-        let Some(ch) = chars.next() else {
-            return output.to_string();
-        };
-        truncated.push(ch);
-    }
-    let omitted = chars.count();
-    if omitted == 0 {
-        return output.to_string();
-    }
-    CUT_TOOL_OUTPUTS.with(|cut| cut.set(cut.get().saturating_add(1)));
-    truncated.push_str(&format!(
-        "\n[truncated {omitted} additional chars from tool output]"
-    ));
-    truncated
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ModernCodexMessageSignature {
     role: String,
@@ -671,7 +638,35 @@ fn modern_codex_message_signature(message: &NormalizedMessage) -> ModernCodexMes
     }
 }
 
+fn is_chunk(message: &NormalizedMessage) -> bool {
+    message
+        .extra
+        .get(franken_agent_detection::MESSAGE_CHUNK_KEY)
+        .is_some()
+}
+
+fn is_continuation_chunk(message: &NormalizedMessage) -> bool {
+    message
+        .extra
+        .get(franken_agent_detection::MESSAGE_CHUNK_KEY)
+        .and_then(|record| record.get("ordinal"))
+        .and_then(Value::as_u64)
+        .is_some_and(|ordinal| ordinal > 0)
+}
+
+/// Hash of a raw record. Chunk 0 of a split message carries the raw record
+/// plus a chunk record, which is left out so it still matches the raw line.
 fn modern_codex_raw_signature(raw: &Value) -> [u8; 32] {
+    let stripped;
+    let raw = match raw.as_object() {
+        Some(map) if map.contains_key(franken_agent_detection::MESSAGE_CHUNK_KEY) => {
+            let mut map = map.clone();
+            map.remove(franken_agent_detection::MESSAGE_CHUNK_KEY);
+            stripped = Value::Object(map);
+            &stripped
+        }
+        _ => raw,
+    };
     let mut bytes = Vec::new();
     if serde_json::to_writer(&mut bytes, raw).is_err() {
         bytes.extend_from_slice(raw.to_string().as_bytes());
@@ -812,20 +807,6 @@ fn tool_call_content_has_name(content: &str, tool_name: &str) -> bool {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    #[test]
-    fn a_tool_output_at_the_limit_is_kept_whole_and_not_counted_as_cut() {
-        take_cut_tool_outputs();
-        let exact = "a".repeat(MAX_INDEXED_TOOL_OUTPUT_CHARS);
-        assert_eq!(truncate_tool_output(&exact), exact);
-        assert_eq!(take_cut_tool_outputs(), 0);
-        let over = "a".repeat(MAX_INDEXED_TOOL_OUTPUT_CHARS + 1);
-        assert!(
-            truncate_tool_output(&over)
-                .ends_with("[truncated 1 additional chars from tool output]")
-        );
-        assert_eq!(take_cut_tool_outputs(), 1);
-    }
 
     fn message(content: &str, call_id: Option<&str>) -> NormalizedMessage {
         NormalizedMessage {
@@ -1031,41 +1012,34 @@ mod tests {
     }
 
     #[test]
-    fn only_a_cut_tool_output_the_pass_keeps_counts_as_cut() -> Result<()> {
+    fn a_long_tool_output_is_added_whole_in_chunks_and_matches_fad_chunk_zero() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("rollout-long-output.jsonl");
+        let text = "z".repeat(franken_agent_detection::MESSAGE_CHUNK_BYTES + 10);
         let output = response(serde_json::json!({
             "type": "function_call_output",
             "call_id": "call-1",
-            "output": "z".repeat(MAX_INDEXED_TOOL_OUTPUT_CHARS + 10),
+            "output": text,
         }));
         std::fs::write(&path, format!("{output}\n"))?;
 
-        // Nothing stored yet: the pass adds the cut output, so it counts.
-        take_cut_tool_outputs();
+        // Nothing stored yet: the pass adds the whole output as chunks.
         let mut conversation = conversation_at(&path);
         augment_modern_codex_messages(&mut conversation, None)?;
-        assert!(
-            conversation.messages[0]
-                .content
-                .contains("[truncated 10 additional chars")
-        );
-        assert_eq!(take_cut_tool_outputs(), 1);
+        assert_eq!(conversation.messages.len(), 2);
+        let joined: String = conversation
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(joined, format!("[Tool output: call-1]\n{text}"));
+        assert!(is_continuation_chunk(&conversation.messages[1]));
 
-        // The same record already stored whole (as FAD stores it): the cut
-        // candidate is dropped and nothing counts as cut.
-        let mut whole = conversation_at(&path);
-        let mut stored = modern_codex_message(&output).expect("tool output");
-        stored.content = "z".repeat(MAX_INDEXED_TOOL_OUTPUT_CHARS + 10);
-        whole.messages.push(stored);
-        take_cut_tool_outputs();
-        augment_modern_codex_messages(&mut whole, None)?;
-        assert_eq!(whole.messages.len(), 1);
-        assert_eq!(
-            whole.messages[0].content.len(),
-            MAX_INDEXED_TOOL_OUTPUT_CHARS + 10
-        );
-        assert_eq!(take_cut_tool_outputs(), 0);
+        // A second pass over the same file finds chunk 0 by its raw record
+        // and adds nothing.
+        let before = serde_json::to_value(&conversation)?;
+        augment_modern_codex_messages(&mut conversation, None)?;
+        assert_eq!(serde_json::to_value(&conversation)?, before);
         Ok(())
     }
 
