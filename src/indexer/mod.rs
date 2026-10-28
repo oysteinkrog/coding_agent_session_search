@@ -33507,10 +33507,14 @@ pub mod persist {
 
     /// Step 6: the document of chunk k indexes the head of chunk k+1, so a
     /// change to row k+1 (stored in a later part, replaced, re-chunked or
-    /// deleted; `changed` lists its idx in every case) must refresh an
+    /// deleted; the caller lists its idx in `changed`) must refresh an
     /// unchanged row k too: its head may be new, different or gone. Only a
     /// full-size row can carry a head, so the usual cost is one indexed query
     /// that finds nothing.
+    ///
+    /// The publish path passes only inserted and updated rows. No production
+    /// path deletes a single row of a live conversation today; one that does
+    /// must call this with the deleted idx.
     pub(super) fn refresh_unchanged_chunk_predecessors(
         storage: &FrankenStorage,
         index: &mut TantivyIndex,

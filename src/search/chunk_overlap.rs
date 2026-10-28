@@ -19,7 +19,9 @@
 //! the first separator in chunk k on are exactly the tokens the whole message
 //! has over the same bytes. Where the head has no separator near the limit
 //! (one very long token, such as base64), it ends at the last separator
-//! before the limit, or is empty.
+//! before the limit, or is empty. That loses no indexed token: a run with no
+//! separator for 4 KiB is longer than the analyzer's longest token, so it is
+//! never indexed, and any token after it lies out of phrase range.
 //!
 //! Chunk k is searchable without its head until chunk k+1 is stored and the
 //! incremental publish refreshes chunk k's document.
