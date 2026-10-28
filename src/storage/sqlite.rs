@@ -12394,15 +12394,36 @@ impl FrankenStorage {
         &self,
         conversation_id: i64,
         idx_range: Option<(i64, i64)>,
+        f: F,
+    ) -> Result<bool>
+    where
+        F: FnMut(Message) -> Result<bool>,
+    {
+        self.for_each_rebuild_message(conversation_id, idx_range, true, f)
+    }
+
+    /// [`Self::for_each_lexical_rebuild_message`], with the chunk overlap only
+    /// when `with_overlap` is set. Readers that are not building lexical
+    /// documents (semantic embedding, daily stats) must see each row's own
+    /// text.
+    fn for_each_rebuild_message<F>(
+        &self,
+        conversation_id: i64,
+        idx_range: Option<(i64, i64)>,
+        with_overlap: bool,
         mut f: F,
     ) -> Result<bool>
     where
         F: FnMut(Message) -> Result<bool>,
     {
-        let overlaps = self.lexical_chunk_overlaps(&LexicalOverlapScope::Conversation {
-            conversation_id,
-            idx_range,
-        })?;
+        let overlaps = if with_overlap {
+            self.lexical_chunk_overlaps(&LexicalOverlapScope::Conversation {
+                conversation_id,
+                idx_range,
+            })?
+        } else {
+            HashMap::new()
+        };
         let range_clause = if idx_range.is_some() {
             " AND idx >= ?2 AND idx <= ?3"
         } else {
@@ -12466,6 +12487,34 @@ impl FrankenStorage {
             }
             Err(err)
         })
+    }
+
+    /// Every message of each conversation in `conversation_ids`, with its own
+    /// text and no chunk overlap: the input for semantic embedding and stats,
+    /// which must not see text from a neighbouring chunk.
+    pub fn fetch_canonical_messages_batch(
+        &self,
+        conversation_ids: &[i64],
+    ) -> Result<HashMap<i64, Vec<Message>>> {
+        let mut grouped: HashMap<i64, Vec<Message>> =
+            HashMap::with_capacity(conversation_ids.len());
+        for &conversation_id in conversation_ids {
+            if grouped.contains_key(&conversation_id) {
+                continue;
+            }
+            let mut messages = Vec::new();
+            self.for_each_rebuild_message(conversation_id, None, false, |message| {
+                messages.push(message);
+                Ok(true)
+            })
+            .with_context(|| {
+                format!("fetching canonical messages for conversation {conversation_id}")
+            })?;
+            if !messages.is_empty() {
+                grouped.insert(conversation_id, messages);
+            }
+        }
+        Ok(grouped)
     }
 
     /// Fetch messages for multiple conversations during lexical rebuilds.

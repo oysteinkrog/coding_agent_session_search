@@ -1723,8 +1723,7 @@ fn fetch_canonical_embedding_batch_inner_with_caps_and_total(
 
     let conversations = fetch_canonical_embedding_conversations(storage, &conversation_ids)?;
 
-    let mut grouped_messages =
-        storage.fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)?;
+    let mut grouped_messages = storage.fetch_canonical_messages_batch(&conversation_ids)?;
     let CheckpointCappedSelection {
         conversations,
         last_conversation_id,
@@ -1975,8 +1974,7 @@ where
     }
 
     let conversations = fetch_canonical_embedding_conversations(storage, conversation_ids)?;
-    let mut grouped_messages =
-        storage.fetch_messages_for_lexical_rebuild_batch(conversation_ids, None, None)?;
+    let mut grouped_messages = storage.fetch_canonical_messages_batch(conversation_ids)?;
     Ok(
         packet_embedding_inputs_from_materialized_canonical_messages(
             &conversations,
@@ -7308,6 +7306,69 @@ mod tests {
         Ok(())
     }
 
+    /// Step 6: the lexical readers add text from the neighbouring chunk of a
+    /// split message; the embedding input of every chunk must still be
+    /// exactly its own text.
+    #[test]
+    fn embedding_input_of_a_split_message_chunk_is_its_own_text() -> Result<()> {
+        use franken_agent_detection::{MESSAGE_CHUNK_BYTES, MESSAGE_CHUNK_KEY};
+
+        let temp = tempdir().unwrap();
+        let storage = FrankenStorage::open(&temp.path().join("agent_search.db"))?;
+        let agent_id = storage.ensure_agent(&Agent {
+            id: None,
+            slug: "codex".to_string(),
+            name: "Codex".to_string(),
+            version: None,
+            kind: AgentKind::Cli,
+        })?;
+        let first = "chunkword ".repeat(MESSAGE_CHUNK_BYTES / 10);
+        let first = format!("{first}{}", "x".repeat(MESSAGE_CHUNK_BYTES - first.len()));
+        let second = "second chunk text".to_string();
+        let total = first.len() + second.len();
+        let chunk = |ordinal: u64, start: usize, end: usize| {
+            json!({MESSAGE_CHUNK_KEY: {
+                "group": "g", "ordinal": ordinal, "byte_start": start,
+                "byte_end": end, "total_bytes": total,
+            }})
+        };
+        let message = |idx: i64, content: String, extra_json: serde_json::Value| Message {
+            id: None,
+            idx,
+            role: MessageRole::Agent,
+            author: None,
+            created_at: Some(1_700_000_000_500 + idx),
+            content,
+            extra_json,
+            snippets: Vec::new(),
+        };
+        storage.insert_conversation_tree(
+            agent_id,
+            None,
+            &test_conversation_with_messages(
+                "split-message",
+                vec![
+                    message(0, first.clone(), chunk(0, 0, first.len())),
+                    message(1, second.clone(), chunk(1, first.len(), total)),
+                ],
+            ),
+        )?;
+
+        let batch = fetch_canonical_embedding_batch(&storage, 0, 1)?;
+        // A long message becomes several inputs (passages), but no input
+        // holds text from the other chunk.
+        let (last, earlier) = batch.inputs.split_last().expect("inputs");
+        assert_eq!(last.content, second);
+        assert!(!earlier.is_empty());
+        for input in earlier {
+            assert!(
+                !input.content.contains("second chunk text"),
+                "an input of chunk 0 holds chunk 1's text"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn canonical_embedding_batch_uses_conversation_packet_semantic_projection() -> Result<()> {
         let temp = tempdir().unwrap();
@@ -8786,8 +8847,7 @@ mod tests {
             |row| row.get_typed(0),
         )?;
         let envelopes = fetch_canonical_embedding_conversations(&storage, &conversation_ids)?;
-        let mut grouped_messages =
-            storage.fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)?;
+        let mut grouped_messages = storage.fetch_canonical_messages_batch(&conversation_ids)?;
         let mut packets: Vec<ConversationPacket> = Vec::with_capacity(envelopes.len());
         let mut contexts: Vec<SemanticPacketContext> = Vec::with_capacity(envelopes.len());
         for envelope in &envelopes {

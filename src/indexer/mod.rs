@@ -13007,7 +13007,7 @@ fn rebuild_daily_stats_from_conversation_packets(
             })
             .collect::<Result<Vec<_>>>()?;
         let mut grouped_messages = storage
-            .fetch_messages_for_lexical_rebuild_batch(&conversation_ids, None, None)
+            .fetch_canonical_messages_batch(&conversation_ids)
             .with_context(|| {
                 format!(
                     "fetching canonical message batch for packet daily_stats rebuild after id {}",
