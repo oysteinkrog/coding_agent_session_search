@@ -866,19 +866,17 @@ fn collapse_split_message_hits(
     kept
 }
 
-/// The overlap the lexical document of message `idx` indexes before its own
-/// text, when that message continues a split message (see
-/// [`crate::search::chunk_overlap`]). A snippet for a phrase that crosses the
-/// chunk cut needs it, because the stored row holds only the chunk. The text
-/// of the row before is read only when the two rows are chunks of one message.
-fn split_message_overlap_tail(
+/// The head of the next chunk that the lexical document of message `idx`
+/// indexes after its own text, when the row after it is the next chunk of the
+/// same split message (see [`crate::search::chunk_overlap`]). A snippet for a
+/// phrase that crosses the chunk cut needs it, because the stored row holds
+/// only the chunk. The text of the next row is read only when the two rows are
+/// chunks of one message.
+fn split_message_overlap_head(
     conn: &SearchSqliteConnection,
     conversation_id: i64,
     idx: i64,
 ) -> Result<Option<String>> {
-    if idx < 1 {
-        return Ok(None);
-    }
     let rows: Vec<serde_json::Value> = franken_query_map_collect_retry(
         conn,
         "SELECT extra_json, extra_bin
@@ -887,8 +885,8 @@ fn split_message_overlap_tail(
          ORDER BY idx",
         &[
             ParamValue::from(conversation_id),
-            ParamValue::from(idx - 1),
             ParamValue::from(idx),
+            ParamValue::from(idx + 1),
         ],
         |row| {
             Ok(crate::storage::sqlite::franken_read_message_extra_compat(
@@ -896,25 +894,25 @@ fn split_message_overlap_tail(
             ))
         },
     )?;
-    let [prev_extra, cur_extra] = rows.as_slice() else {
+    let [cur_extra, next_extra] = rows.as_slice() else {
         return Ok(None);
     };
-    if !crate::search::chunk_overlap::chunk_follows(prev_extra, cur_extra) {
+    if !crate::search::chunk_overlap::chunk_follows(cur_extra, next_extra) {
         return Ok(None);
     }
-    let prev: Vec<String> = franken_query_map_collect_retry(
+    let next: Vec<String> = franken_query_map_collect_retry(
         conn,
         "SELECT content
          FROM messages INDEXED BY sqlite_autoindex_messages_1
          WHERE conversation_id = ?1 AND idx = ?2",
-        &[ParamValue::from(conversation_id), ParamValue::from(idx - 1)],
+        &[ParamValue::from(conversation_id), ParamValue::from(idx + 1)],
         |row| row.get_typed(0),
     )?;
-    let Some(prev) = prev.first() else {
+    let Some(next) = next.first() else {
         return Ok(None);
     };
-    let tail = crate::search::chunk_overlap::overlap_tail(prev);
-    Ok((!tail.is_empty()).then(|| tail.to_owned()))
+    let head = crate::search::chunk_overlap::overlap_head(next);
+    Ok((!head.is_empty()).then(|| head.to_owned()))
 }
 
 fn semantic_message_id_from_db(message_id: i64) -> std::io::Result<u64> {
@@ -8074,7 +8072,7 @@ impl SearchClient {
         *guard = Some(generation);
     }
 
-    fn split_message_overlap_tail_for(
+    fn split_message_overlap_head_for(
         &self,
         conversation_id: Option<i64>,
         line_number: Option<usize>,
@@ -8082,7 +8080,7 @@ impl SearchClient {
         let idx = i64::try_from(line_number?.checked_sub(1)?).ok()?;
         let guard = self.sqlite_guard().ok()?;
         let conn = guard.as_ref()?;
-        split_message_overlap_tail(conn, conversation_id?, idx).unwrap_or_else(|err| {
+        split_message_overlap_head(conn, conversation_id?, idx).unwrap_or_else(|err| {
             tracing::warn!(error = %err, "reading the chunk overlap for a snippet failed");
             None
         })
@@ -8499,25 +8497,25 @@ impl SearchClient {
                     let rendered = if !pending.stored_content.is_empty() {
                         generator.snippet(&pending.stored_content)
                     } else if !effective_content.is_empty() {
-                        // A continuation chunk's document also indexes the
-                        // tail of the chunk before it, where a phrase across
-                        // the cut starts. Its preview is then cut short too,
-                        // so only such hits pay for the lookup.
+                        // A chunk's document also indexes the head of the
+                        // next chunk, where a phrase across the cut ends. A
+                        // chunk's preview is cut short, so only such hits pay
+                        // for the lookup.
                         let overlap = if !content_is_hydrated_row
                             || stored_preview_is_complete_content(&pending.stored_preview)
                         {
                             None
                         } else {
-                            self.split_message_overlap_tail_for(
+                            self.split_message_overlap_head_for(
                                 pending.conversation_id,
                                 pending.line_number,
                             )
                         };
                         match overlap {
-                            Some(tail) => {
+                            Some(head) => {
                                 generator.snippet(&crate::search::chunk_overlap::lexical_text(
-                                    Some(&tail),
                                     &effective_content,
+                                    Some(&head),
                                 ))
                             }
                             None => generator.snippet(&effective_content),
@@ -23676,14 +23674,17 @@ mod tests {
     // SQL Placeholder Builder Tests (Opt 4.5: Pre-sized String Buffers)
     // =============================================================================
 
-    /// Step 6 ranking check: how much the overlap in front of a continuation
-    /// chunk lowers the score and rank of a term in the chunk's own text,
-    /// over a spread of chunk sizes. A measurement, run on demand with
-    /// `--ignored --nocapture`; it asserts only that the hit is still found.
+    /// Step 6 ranking check: how much the head of the next chunk behind a
+    /// chunk changes the score and rank of a term in the chunk's own text,
+    /// with the term at the start and in the middle, over a spread of chunk
+    /// sizes. Only a full 4 MiB chunk has a successor, so only that row gets a
+    /// head in practice; the smaller sizes show the effect if one did. A
+    /// measurement, run on demand with `--ignored --nocapture`; it asserts
+    /// only that the hit is still found.
     #[test]
     #[ignore = "measurement; prints scores"]
     fn chunk_overlap_ranking_effect_over_chunk_sizes() {
-        use crate::search::chunk_overlap::{MAX_CROSS_CHUNK_PHRASE_BYTES, overlap_tail};
+        use crate::search::chunk_overlap::{MAX_CROSS_CHUNK_PHRASE_BYTES, overlap_head};
 
         let filler_word = |i: usize| format!("fill{} ", i % 997);
         let filler = |bytes: usize| {
@@ -23695,8 +23696,8 @@ mod tests {
             }
             text
         };
-        let previous_chunk = filler(MAX_CROSS_CHUNK_PHRASE_BYTES * 2);
-        let tail = overlap_tail(&previous_chunk).to_string();
+        let next_chunk = filler(MAX_CROSS_CHUNK_PHRASE_BYTES * 2);
+        let head = overlap_head(&next_chunk).to_string();
         let message = |path: &str, content: String| NormalizedConversation {
             agent_slug: "agent".into(),
             external_id: None,
@@ -23717,15 +23718,19 @@ mod tests {
                 invocations: Vec::new(),
             }],
         };
-        for chunk_bytes in [1 << 10, 16 << 10, 256 << 10, 4 << 20] {
-            // The term sits in the middle of the chunk's own text, as in a
-            // real chunk; at the start it would also match the content prefix
-            // field, which the overlap moves away from the document start.
-            let own = format!(
-                "{} rankneedle {}",
-                filler(chunk_bytes / 2),
-                filler(chunk_bytes / 2)
-            );
+        for (place, chunk_bytes) in ["start", "middle"]
+            .into_iter()
+            .flat_map(|place| [1 << 10, 16 << 10, 256 << 10, 4 << 20].map(|size| (place, size)))
+        {
+            let own = if place == "start" {
+                format!("rankneedle {}", filler(chunk_bytes))
+            } else {
+                format!(
+                    "{} rankneedle {}",
+                    filler(chunk_bytes / 2),
+                    filler(chunk_bytes / 2)
+                )
+            };
             let mut observed = Vec::new();
             for with_overlap in [false, true] {
                 let dir = TempDir::new().unwrap();
@@ -23741,7 +23746,7 @@ mod tests {
                         .unwrap();
                 }
                 let content = if with_overlap {
-                    crate::search::chunk_overlap::lexical_text(Some(&tail), &own)
+                    crate::search::chunk_overlap::lexical_text(&own, Some(&head))
                 } else {
                     own.clone()
                 };
@@ -23766,7 +23771,7 @@ mod tests {
             }
             let (plain, overlapped) = (observed[0], observed[1]);
             println!(
-                "chunk {:>8} B: score {:.4} -> {:.4} ({:+.1}%), rank {} -> {} of {}",
+                "term at {place:<6} chunk {:>8} B: score {:.4} -> {:.4} ({:+.1}%), rank {} -> {} of {}",
                 own.len(),
                 plain.0,
                 overlapped.0,

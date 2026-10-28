@@ -4908,18 +4908,12 @@ pub(crate) enum LexicalOverlapScope {
         conversation_id: i64,
         idx_range: Option<(i64, i64)>,
     },
-    /// Rows with `after < id <= through`.
-    MessageIds { after: i64, through: i64 },
 }
 
-/// Message ids per window of [`FrankenStorage::for_each_lexical_rebuild_message_after_id`],
-/// so the overlaps it holds at once stay bounded however many rows follow.
-const LEXICAL_AFTER_ID_WINDOW: i64 = 65_536;
-
-/// Put the overlap from the chunk before `message` in front of its text.
-fn with_lexical_overlap(message: &mut Message, tail: Option<&String>) {
-    if let Some(tail) = tail {
-        message.content = crate::search::chunk_overlap::lexical_text(Some(tail), &message.content);
+/// Put the head of the chunk after `message` behind its text.
+fn with_lexical_overlap(message: &mut Message, head: Option<&String>) {
+    if let Some(head) = head {
+        message.content.push_str(head);
     }
 }
 
@@ -12152,63 +12146,48 @@ impl FrankenStorage {
         scope: &LexicalOverlapScope,
     ) -> Result<HashMap<(i64, i64), String>> {
         // A chunk other than the last is cut at a char boundary at most 3
-        // bytes short of the chunk size.
+        // bytes short of the chunk size, so only such a row can be followed
+        // by a chunk of its message. Full-size rows are rare: for most
+        // conversations this indexed query is the whole cost.
         let full = i64::try_from(franken_agent_detection::MESSAGE_CHUNK_BYTES.saturating_sub(3))
             .unwrap_or(i64::MAX);
-        // For one conversation the join is driven from the predecessor `p`:
-        // full-size rows are rare, so only they cost an index lookup for the
-        // row after them. For an id window it is driven from the window's
-        // rows `m`, whose predecessor may lie before the window.
-        let from_predecessor = "SELECT m.conversation_id, m.idx FROM messages p \
-             CROSS JOIN messages m ON m.conversation_id = p.conversation_id AND m.idx = p.idx + 1 \
-             WHERE COALESCE(octet_length(p.content), 0) >= ?1";
-        let (sql, params) = match *scope {
-            LexicalOverlapScope::Conversation {
-                conversation_id,
-                idx_range: None,
-            } => (
-                format!("{from_predecessor} AND p.conversation_id = ?2"),
+        let LexicalOverlapScope::Conversation {
+            conversation_id,
+            idx_range,
+        } = *scope;
+        let (sql, params) = match idx_range {
+            None => (
+                "SELECT idx FROM messages \
+                 WHERE conversation_id = ?2 AND COALESCE(octet_length(content), 0) >= ?1"
+                    .to_string(),
                 vec![ParamValue::from(full), ParamValue::from(conversation_id)],
             ),
-            LexicalOverlapScope::Conversation {
-                conversation_id,
-                idx_range: Some((first_idx, last_idx)),
-            } => (
-                format!("{from_predecessor} AND p.conversation_id = ?2 AND p.idx >= ?3 AND p.idx <= ?4"),
-                vec![
-                    ParamValue::from(full),
-                    ParamValue::from(conversation_id),
-                    ParamValue::from(first_idx.saturating_sub(1)),
-                    ParamValue::from(last_idx.saturating_sub(1)),
-                ],
-            ),
-            LexicalOverlapScope::MessageIds { after, through } => (
-                "SELECT m.conversation_id, m.idx FROM messages m \
-                 CROSS JOIN messages p ON p.conversation_id = m.conversation_id AND p.idx = m.idx - 1 \
-                 WHERE m.id > ?2 AND m.id <= ?3 AND COALESCE(octet_length(p.content), 0) >= ?1"
+            Some((first_idx, last_idx)) => (
+                "SELECT idx FROM messages \
+                 WHERE conversation_id = ?2 AND idx >= ?3 AND idx <= ?4 \
+                 AND COALESCE(octet_length(content), 0) >= ?1"
                     .to_string(),
                 vec![
                     ParamValue::from(full),
-                    ParamValue::from(after),
-                    ParamValue::from(through),
+                    ParamValue::from(conversation_id),
+                    ParamValue::from(first_idx),
+                    ParamValue::from(last_idx),
                 ],
             ),
         };
-        let candidates: Vec<(i64, i64)> = self
+        let candidates: Vec<i64> = self
             .conn
-            .query_map_collect(&sql, &params, |row| {
-                Ok((row.get_typed(0)?, row.get_typed(1)?))
-            })
-            .context("finding rows that may continue a split message")?;
+            .query_map_collect(&sql, &params, |row| row.get_typed(0))
+            .context("finding full-size rows that a chunk may follow")?;
         let mut overlaps = HashMap::new();
-        for (conversation_id, idx) in candidates {
+        for idx in candidates {
             let rows = self
                 .conn
                 .query_map_collect(
-                    "SELECT idx, CASE WHEN idx = ?2 THEN content END, extra_json, extra_bin \
+                    "SELECT idx, CASE WHEN idx = ?3 THEN content END, extra_json, extra_bin \
                      FROM messages WHERE conversation_id = ?1 AND idx >= ?2 AND idx <= ?3 \
                      ORDER BY idx",
-                    fparams![conversation_id, idx - 1, idx],
+                    fparams![conversation_id, idx, idx + 1],
                     |row| {
                         Ok((
                             row.get_typed::<Option<String>>(1)?,
@@ -12219,28 +12198,35 @@ impl FrankenStorage {
                 .with_context(|| {
                     format!("reading chunk neighbours {idx} of conversation {conversation_id}")
                 })?;
-            let [(Some(prev_content), prev_extra), (_, cur_extra)] = rows.as_slice() else {
+            let [(_, cur_extra), (Some(next_content), next_extra)] = rows.as_slice() else {
                 continue;
             };
-            if crate::search::chunk_overlap::chunk_follows(prev_extra, cur_extra) {
-                let tail = crate::search::chunk_overlap::overlap_tail(prev_content);
-                if !tail.is_empty() {
-                    overlaps.insert((conversation_id, idx), tail.to_owned());
+            if crate::search::chunk_overlap::chunk_follows(cur_extra, next_extra) {
+                let head = crate::search::chunk_overlap::overlap_head(next_content);
+                if !head.is_empty() {
+                    overlaps.insert((conversation_id, idx), head.to_owned());
                 }
-            } else if crate::search::chunk_overlap::continues_chunk(cur_extra) {
+            } else if next_extra
+                .get(franken_agent_detection::MESSAGE_CHUNK_KEY)
+                .is_some()
+                && cur_extra
+                    .get(franken_agent_detection::MESSAGE_CHUNK_KEY)
+                    .is_some()
+            {
                 tracing::warn!(
                     conversation_id,
                     idx,
-                    "chunk row does not follow the row before it; indexing it without overlap"
+                    "chunk row is not followed by the next chunk of its message; indexing it without overlap"
                 );
             }
         }
         Ok(overlaps)
     }
 
-    /// Which of `indices` in a conversation hold a chunk that continues a
-    /// split message (ordinal above 0), read from their chunk records.
-    pub(crate) fn lexical_chunk_continuations(
+    /// Which of `indices` in a conversation are full-size rows: only such a
+    /// row can be a chunk with a successor, so only its lexical document can
+    /// carry a head that a change to the row after it makes stale.
+    pub(crate) fn lexical_full_size_rows(
         &self,
         conversation_id: i64,
         indices: &[i64],
@@ -12248,34 +12234,27 @@ impl FrankenStorage {
         if indices.is_empty() {
             return Ok(Vec::new());
         }
+        let full = i64::try_from(franken_agent_detection::MESSAGE_CHUNK_BYTES.saturating_sub(3))
+            .unwrap_or(i64::MAX);
         let placeholders = vec!["?"; indices.len()].join(", ");
         let sql = format!(
-            "SELECT idx, extra_json, extra_bin FROM messages \
-             WHERE conversation_id = ? AND idx IN ({placeholders}) ORDER BY idx"
+            "SELECT idx FROM messages \
+             WHERE conversation_id = ? AND COALESCE(octet_length(content), 0) >= ? \
+             AND idx IN ({placeholders}) ORDER BY idx"
         );
-        let mut params = vec![ParamValue::from(conversation_id)];
+        let mut params = vec![ParamValue::from(conversation_id), ParamValue::from(full)];
         params.extend(indices.iter().copied().map(ParamValue::from));
-        let rows: Vec<(i64, serde_json::Value)> = self
-            .conn
-            .query_map_collect(&sql, &params, |row| {
-                Ok((
-                    row.get_typed(0)?,
-                    franken_read_message_extra_compat(row, 1, 2),
-                ))
-            })
-            .with_context(|| format!("reading chunk records of conversation {conversation_id}"))?;
-        Ok(rows
-            .into_iter()
-            .filter(|(_, extra)| crate::search::chunk_overlap::continues_chunk(extra))
-            .map(|(idx, _)| idx)
-            .collect())
+        self.conn
+            .query_map_collect(&sql, &params, |row| row.get_typed(0))
+            .with_context(|| format!("reading row sizes of conversation {conversation_id}"))
     }
 
     /// Every message with `id > after_message_id`, as `(conversation_id,
-    /// message)` in id order, each read as in
-    /// [`Self::fetch_messages_for_lexical_rebuild`]: a rowid-range scan that
-    /// reads only rows appended after a memo, never the older text of the
-    /// conversations they belong to.
+    /// message)` in id order, with its own text and no chunk overlap: a
+    /// rowid-range scan that reads only rows appended after a memo, never the
+    /// older text of the conversations they belong to. Its caller classifies
+    /// appended rows as noise or not; a head never changes that, because only
+    /// a 4 MiB chunk carries one.
     pub(crate) fn for_each_lexical_rebuild_message_after_id<F>(
         &self,
         after_message_id: i64,
@@ -12284,56 +12263,38 @@ impl FrankenStorage {
     where
         F: FnMut(i64, Message) -> Result<()>,
     {
-        let max_id: i64 = self
-            .conn
-            .query_row_map(
-                "SELECT COALESCE(MAX(id), 0) FROM messages",
-                &[] as &[ParamValue],
-                |row| row.get_typed(0),
-            )
-            .context("reading the max message id for a lexical append scan")?;
         let sql = "SELECT id, idx, role, author, created_at, \
                  content, COALESCE(octet_length(content), 0), conversation_id \
-                 FROM messages WHERE id > ?1 AND id <= ?2 ORDER BY id";
-        let mut after = after_message_id;
-        while after < max_id {
-            let through = after.saturating_add(LEXICAL_AFTER_ID_WINDOW).min(max_id);
-            let overlaps =
-                self.lexical_chunk_overlaps(&LexicalOverlapScope::MessageIds { after, through })?;
-            let mut callback_error = None;
-            let outcome = self.conn.query_with_params_for_each(
-                sql,
-                &[SqliteValue::from(after), SqliteValue::from(through)],
-                |row| {
-                    let conversation_id: i64 = row.get_typed(7)?;
-                    let mut message = lexical_rebuild_message_from_row(row)?;
-                    let tail = overlaps.get(&(conversation_id, message.idx));
-                    with_lexical_overlap(&mut message, tail);
-                    if let Err(err) = f(conversation_id, message) {
-                        callback_error = Some(err);
-                        return Err(crate::franken_sync::FrankenError::Internal(
-                            LEXICAL_REBUILD_STREAM_STOPPED.to_string(),
-                        ));
-                    }
-                    Ok(())
-                },
-            );
-            if let Some(err) = callback_error {
-                return Err(err);
-            }
-            outcome.with_context(|| {
-                format!("streaming lexical messages appended after message id {after_message_id}")
-            })?;
-            after = through;
+                 FROM messages WHERE id > ?1 ORDER BY id";
+        let mut callback_error = None;
+        let outcome = self.conn.query_with_params_for_each(
+            sql,
+            &[SqliteValue::from(after_message_id)],
+            |row| {
+                let conversation_id: i64 = row.get_typed(7)?;
+                let message = lexical_rebuild_message_from_row(row)?;
+                if let Err(err) = f(conversation_id, message) {
+                    callback_error = Some(err);
+                    return Err(crate::franken_sync::FrankenError::Internal(
+                        LEXICAL_REBUILD_STREAM_STOPPED.to_string(),
+                    ));
+                }
+                Ok(())
+            },
+        );
+        if let Some(err) = callback_error {
+            return Err(err);
         }
-        Ok(())
+        outcome.with_context(|| {
+            format!("streaming lexical messages appended after message id {after_message_id}")
+        })
     }
 
     /// `(idx, indexed text bytes)` for every message of a conversation in
     /// `idx` order, read from record metadata without the text itself: the
-    /// input for splitting a long conversation into bounded chunks. A row
-    /// right after a full-size row may continue a split message, so it also
-    /// counts the longest overlap it can carry.
+    /// input for splitting a long conversation into bounded chunks. A
+    /// full-size row followed by another row may be a chunk with a successor,
+    /// so it also counts the longest head it can carry.
     pub fn lexical_rebuild_message_footprints(
         &self,
         conversation_id: i64,
@@ -12352,23 +12313,20 @@ impl FrankenStorage {
         };
         let params = [SqliteValue::from(conversation_id)];
         let read = |sql: &str| -> Result<Vec<(i64, usize)>> {
-            let mut footprints = Vec::new();
-            let mut previous: Option<(i64, usize)> = None;
+            let mut footprints: Vec<(i64, usize)> = Vec::new();
             self.conn
                 .query_with_params_for_each(sql, &params, |row| {
                     let idx = row.get_typed::<i64>(0)?;
                     let stored =
                         usize::try_from(row.get_typed::<i64>(1)?.max(0)).unwrap_or(usize::MAX);
-                    let overlap = match previous {
-                        Some((prev_idx, prev_bytes))
-                            if prev_idx + 1 == idx && prev_bytes >= full =>
-                        {
-                            crate::search::chunk_overlap::MAX_OVERLAP_BYTES
-                        }
-                        _ => 0,
-                    };
-                    previous = Some((idx, stored));
-                    footprints.push((idx, stored.saturating_add(overlap)));
+                    if let Some((prev_idx, prev_bytes)) = footprints.last_mut()
+                        && *prev_idx + 1 == idx
+                        && *prev_bytes >= full
+                    {
+                        *prev_bytes = prev_bytes
+                            .saturating_add(crate::search::chunk_overlap::MAX_OVERLAP_BYTES);
+                    }
+                    footprints.push((idx, stored));
                     Ok(())
                 })
                 .with_context(|| {
@@ -26908,12 +26866,12 @@ mod tests {
         assert!(stored.iter().all(|message| !message.extra_json.is_null()));
     }
 
-    /// Step 6: every lexical reader puts the tail of chunk k in front of chunk
-    /// k+1 of the same split message, and only there.
+    /// Step 6: every lexical reader puts the head of chunk k+1 behind chunk k
+    /// of the same split message, and only there.
     #[test]
-    fn lexical_readers_put_the_previous_chunk_tail_before_a_continuation_chunk() {
+    fn lexical_readers_put_the_next_chunk_head_behind_a_chunk() {
         use crate::model::types::{Agent, AgentKind, Conversation, Message, MessageRole};
-        use crate::search::chunk_overlap::{MAX_OVERLAP_BYTES, overlap_tail};
+        use crate::search::chunk_overlap::{MAX_OVERLAP_BYTES, overlap_head};
         use franken_agent_detection::{MESSAGE_CHUNK_BYTES, MESSAGE_CHUNK_KEY};
         use std::path::PathBuf;
 
@@ -26987,7 +26945,7 @@ mod tests {
             )
             .unwrap();
 
-        let expected = format!("{}{second}", overlap_tail(&first));
+        let expected = format!("{first}{}", overlap_head(&second));
         let contents = |messages: &[Message]| -> Vec<String> {
             messages
                 .iter()
@@ -27000,19 +26958,35 @@ mod tests {
         assert_eq!(
             contents(&whole),
             vec![
-                first.clone(),
                 expected.clone(),
+                second.clone(),
                 first.clone(),
                 "an ordinary reply".to_string()
             ],
-            "only the row that follows its own chunk gets the overlap"
+            "only the row that its own next chunk follows gets the head"
         );
-        // A range that starts at the continuation still reads the chunk before it.
+        // Semantic embedding and stats read each row's own text.
+        let canonical = storage
+            .fetch_canonical_messages_batch(&[conversation_id])
+            .unwrap()
+            .remove(&conversation_id)
+            .unwrap();
+        assert_eq!(
+            contents(&canonical),
+            vec![
+                first.clone(),
+                second.clone(),
+                first.clone(),
+                "an ordinary reply".to_string()
+            ],
+            "the canonical batch has no overlap"
+        );
+        // A range that ends at the chunk still reads the head after it.
         let range = storage
-            .fetch_messages_for_lexical_rebuild_idx_range(conversation_id, 1, 1)
+            .fetch_messages_for_lexical_rebuild_idx_range(conversation_id, 0, 0)
             .unwrap();
         assert_eq!(contents(&range), vec![expected.clone()]);
-        // The id-ordered reader of a resumed rebuild does the same.
+        // The id-ordered reader that counts appended rows reads own text.
         let first_id = whole[0].id.unwrap();
         let mut after = Vec::new();
         storage
@@ -27021,22 +26995,28 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(after[0].content, expected);
-        assert_eq!(after.len(), 3);
-        // Footprints count the overlap a row after a full-size row may carry.
+        assert_eq!(
+            contents(&after),
+            vec![
+                second.clone(),
+                first.clone(),
+                "an ordinary reply".to_string()
+            ]
+        );
+        // Footprints count the head a full-size row followed by a row may carry.
         let footprints = storage
             .lexical_rebuild_message_footprints(conversation_id)
             .unwrap();
         assert_eq!(
             footprints,
             vec![
-                (0, first.len()),
-                (1, second.len() + MAX_OVERLAP_BYTES),
-                (2, first.len()),
-                (3, "an ordinary reply".len() + MAX_OVERLAP_BYTES),
+                (0, first.len() + MAX_OVERLAP_BYTES),
+                (1, second.len()),
+                (2, first.len() + MAX_OVERLAP_BYTES),
+                (3, "an ordinary reply".len()),
             ]
         );
-        assert!(footprints[1].1 >= expected.len());
+        assert!(footprints[0].1 >= expected.len());
     }
 
     #[test]

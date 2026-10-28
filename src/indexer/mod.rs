@@ -33496,38 +33496,45 @@ pub mod persist {
                 |_| Ok(()),
             )?;
         }
-        refresh_unchanged_chunk_successors(storage, index, packet, positional, conversation_id)
-    }
-
-    /// Step 6: the document of chunk k+1 indexes the tail of chunk k, so a
-    /// changed row k must refresh an unchanged chunk k+1 too: its overlap may
-    /// have changed or, when row k shrank or left the message, must go. Every
-    /// chunk of a message shares a group derived from the whole text, so a
-    /// change to one chunk normally rewrites all of them and this finds
-    /// nothing; it guards the rule rather than a known path. An append has
-    /// no rows after it, so the usual cost is one empty indexed query.
-    fn refresh_unchanged_chunk_successors(
-        storage: &FrankenStorage,
-        index: &mut TantivyIndex,
-        packet: &ConversationPacket,
-        positional: &[usize],
-        conversation_id: i64,
-    ) -> Result<()> {
         let messages = &packet.payload.messages;
-        let changed: HashSet<i64> = positional
+        let changed: Vec<i64> = positional
             .iter()
             .filter_map(|&position| messages.get(position))
             .map(|message| message.idx)
             .collect();
-        let mut successors: Vec<i64> = changed
+        refresh_unchanged_chunk_predecessors(storage, index, conversation_id, &changed)
+    }
+
+    /// Step 6: the document of chunk k indexes the head of chunk k+1, so a
+    /// change to row k+1 (stored in a later part, replaced, re-chunked or
+    /// deleted; `changed` lists its idx in every case) must refresh an
+    /// unchanged row k too: its head may be new, different or gone. Only a
+    /// full-size row can carry a head, so the usual cost is one indexed query
+    /// that finds nothing.
+    pub(super) fn refresh_unchanged_chunk_predecessors(
+        storage: &FrankenStorage,
+        index: &mut TantivyIndex,
+        conversation_id: i64,
+        changed: &[i64],
+    ) -> Result<()> {
+        let changed_set: HashSet<i64> = changed.iter().copied().collect();
+        let mut predecessors: Vec<i64> = changed_set
             .iter()
-            .map(|idx| idx + 1)
-            .filter(|idx| !changed.contains(idx))
+            .map(|idx| idx - 1)
+            .filter(|idx| *idx >= 0 && !changed_set.contains(idx))
             .collect();
-        successors.sort_unstable();
-        for successor in storage.lexical_chunk_continuations(conversation_id, &successors)? {
+        predecessors.sort_unstable();
+        let stale = storage.lexical_full_size_rows(conversation_id, &predecessors)?;
+        if stale.is_empty() {
+            return Ok(());
+        }
+        // Quill refuses to replace a document that is still staged in this
+        // writer (row k may have been added earlier in the same run), so the
+        // staged work is published first. This happens once per chunk cut.
+        index.commit()?;
+        for predecessor in stale {
             let refreshed =
-                lexical_packet_for_changed_messages(storage, conversation_id, &[successor])?;
+                lexical_packet_for_changed_messages(storage, conversation_id, &[predecessor])?;
             let positions: Vec<usize> = (0..refreshed.payload.messages.len()).collect();
             index.reconcile_messages_from_packet(&refreshed, &positions, Some(conversation_id))?;
         }
@@ -37171,9 +37178,11 @@ pub mod persist {
                     1,
                     "{label}: the phrase across the cut matches once"
                 );
-                assert_eq!(phrase[0].line_number, Some(3), "{label}: in chunk 1");
-                assert_eq!(
-                    phrase[0].content, second,
+                // Chunk 0's document holds the head of chunk 1, which arrived
+                // in a later part: the refresh ran.
+                assert_eq!(phrase[0].line_number, Some(2), "{label}: in chunk 0");
+                assert!(
+                    phrase[0].content == first,
                     "{label}: content is the chunk itself"
                 );
                 assert!(
@@ -37185,15 +37194,18 @@ pub mod persist {
                 let filler_hits = search("loremword");
                 let mut lines: Vec<_> = filler_hits.iter().map(|hit| hit.line_number).collect();
                 lines.sort_unstable();
-                assert_eq!(lines.len(), 2, "{label}: one hit per message: {lines:?}");
-                assert!(lines.contains(&Some(4)), "{label}: the reply: {lines:?}");
-                assert!(
-                    lines.contains(&Some(2)) || lines.contains(&Some(3)),
-                    "{label}: one chunk of the split message: {lines:?}"
+                assert_eq!(
+                    lines,
+                    vec![Some(2), Some(4)],
+                    "{label}: chunk 0 and the reply"
                 );
+                // Both chunks hold "crossingbeta" (chunk 0 through its head):
+                // one hit for the split message.
                 let beta = search("crossingbeta");
                 assert_eq!(beta.len(), 1, "{label}");
-                assert_eq!(beta[0].line_number, Some(3), "{label}");
+                let alpha = search("crossingalpha");
+                assert_eq!(alpha.len(), 1, "{label}");
+                assert_eq!(alpha[0].line_number, Some(2), "{label}");
                 (
                     phrase
                         .iter()
@@ -37212,8 +37224,8 @@ pub mod persist {
                 "incremental and rebuild documents give the same hits"
             );
 
-            // A revision shrinks row 1: the unchanged chunk after it must lose
-            // the overlap it took from row 1.
+            // Row 2 (chunk 1) is deleted: the unchanged chunk before it must
+            // lose the head it took from row 2.
             let conversation_id: i64 = storage
                 .raw()
                 .query_row_map("SELECT id FROM conversations", &[], |row| row.get_typed(0))
@@ -37221,26 +37233,13 @@ pub mod persist {
             storage
                 .raw()
                 .execute_compat(
-                    "UPDATE messages SET content = ?1 WHERE conversation_id = ?2 AND idx = 1",
-                    &[
-                        ParamValue::from("a short revision"),
-                        ParamValue::from(conversation_id),
-                    ],
+                    "DELETE FROM messages WHERE conversation_id = ?1 AND idx = 2",
+                    &[ParamValue::from(conversation_id)],
                 )
                 .unwrap();
             let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
-            let packet =
-                lexical_packet_for_changed_messages(&storage, conversation_id, &[1]).unwrap();
-            publish_changed_packet_messages(
-                &storage,
-                &mut index,
-                &packet,
-                &[0],
-                conversation_id,
-                true,
-            )
-            .unwrap();
-            assert_eq!(tantivy_doc_count(&mut index), 4);
+            refresh_unchanged_chunk_predecessors(&storage, &mut index, conversation_id, &[2])
+                .unwrap();
             drop(index);
             let client = SearchClient::open(&index_path, Some(&db_path))
                 .unwrap()
@@ -37252,13 +37251,82 @@ pub mod persist {
             };
             assert!(
                 search("\"crossingalpha crossingbeta\"").is_empty(),
-                "the successor no longer indexes the old tail"
+                "chunk 0 no longer indexes the deleted chunk's head"
             );
-            assert_eq!(search("crossingbeta").len(), 1);
+            let alpha = search("crossingalpha");
+            assert_eq!(alpha.len(), 1);
+            assert_eq!(alpha[0].line_number, Some(2));
+        }
+
+        /// The chunk refresh publishes staged work (a commit) only when a
+        /// full-size row before a changed row needs its document rebuilt; an
+        /// ordinary append never adds a commit.
+        #[test]
+        #[serial]
+        fn chunk_refresh_commits_only_when_a_full_size_predecessor_needs_it() {
+            let _defer = set_env("CASS_DEFER_LEXICAL_UPDATES", "0");
+            let dir = tempfile::TempDir::new().unwrap();
+            let storage = create_franken_db(&dir.path().join("agent_search.db"));
+            let index_path = crate::search::tantivy::index_dir(dir.path()).unwrap();
+            let mut index = TantivyIndex::open_or_create(&index_path).unwrap();
+            let message = |idx: i64, content: &str| NormalizedMessage {
+                idx,
+                role: "user".into(),
+                author: None,
+                created_at: Some(1_700_000_000_000 + idx),
+                content: content.into(),
+                extra: serde_json::json!({"uuid": format!("short-{idx}")}),
+                snippets: Vec::new(),
+                invocations: Vec::new(),
+            };
+            let conversation = |external_id: &str, messages| NormalizedConversation {
+                agent_slug: "claude_code".into(),
+                external_id: Some(external_id.into()),
+                title: None,
+                workspace: Some(dir.path().join("workspace")),
+                source_path: dir.path().join(format!("{external_id}.jsonl")),
+                started_at: Some(1_700_000_000_000),
+                ended_at: Some(1_700_000_000_001),
+                metadata: serde_json::Value::Null,
+                messages,
+            };
+            persist_conversation(
+                &storage,
+                &mut index,
+                &conversation("short", vec![message(0, "first"), message(1, "second")]),
+            )
+            .unwrap();
+            index.commit().unwrap();
+            let published = |index: &TantivyIndex| {
+                let reader = index.reader().unwrap();
+                crate::search::quill_bridge::refresh_reader(&reader).unwrap();
+                reader.doc_count().unwrap()
+            };
+            let before = published(&index);
+            // Staged, not yet published.
+            index
+                .add_conversation(&conversation("staged", vec![message(0, "staged text")]))
+                .unwrap();
+            let conversation_id: i64 = storage
+                .raw()
+                .query_row_map(
+                    "SELECT id FROM conversations WHERE external_id = 'short'",
+                    &[],
+                    |row| row.get_typed(0),
+                )
+                .unwrap();
+            refresh_unchanged_chunk_predecessors(&storage, &mut index, conversation_id, &[1])
+                .unwrap();
             assert_eq!(
-                search("loremword").len(),
-                1,
-                "only the reply still has the filler"
+                published(&index),
+                before,
+                "a short predecessor needs no refresh, so nothing was committed"
+            );
+            index.commit().unwrap();
+            assert_eq!(
+                published(&index),
+                before + 1,
+                "the staged document was pending"
             );
         }
 
